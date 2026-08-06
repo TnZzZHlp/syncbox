@@ -1,0 +1,20 @@
+[Unit]
+Description=Syncbox P2P directory synchronization
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=SYNCBOX_DATA_DIR=/var/lib/syncbox
+ExecStart=/usr/local/bin/syncbox run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
