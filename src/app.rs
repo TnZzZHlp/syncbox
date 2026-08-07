@@ -410,7 +410,7 @@ impl App {
         };
         let heartbeat_stale =
             now_ms.saturating_sub(status.heartbeat_at_ms) > STATUS_HEARTBEAT_STALE_MS;
-        let process_alive = process_alive(status.process_id).unwrap_or(true);
+        let process_alive = process_alive(status.process_id);
         let active = lock_held && !heartbeat_stale && process_alive && status.process_id != 0;
         if active {
             Ok(RuntimeAssessment {
@@ -750,21 +750,22 @@ fn display_optional(value: Option<&str>) -> &str {
 }
 
 #[cfg(target_os = "linux")]
-fn process_alive(process_id: u32) -> Option<bool> {
+fn process_alive(process_id: u32) -> bool {
     if process_id == 0 {
-        return Some(false);
+        return false;
     }
-    Some(Path::new("/proc").join(process_id.to_string()).exists())
+    Path::new("/proc").join(process_id.to_string()).exists()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_alive(process_id: u32) -> Option<bool> {
+#[allow(clippy::unnecessary_wraps)]
+fn process_alive(process_id: u32) -> bool {
     if process_id == 0 {
-        Some(false)
+        false
     } else {
         // The lock plus a fresh heartbeat remains authoritative on platforms where the process
         // table is not exposed through a portable standard-library API.
-        None
+        true
     }
 }
 
