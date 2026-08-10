@@ -1158,14 +1158,21 @@ fn ensure_local_directory(root: &Path, manifest_path: &str) -> Result<()> {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 bail!("refusing to replace symbolic link {}", target.display())
             }
-            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(metadata) if metadata.is_dir() => return Ok(()),
+            // A newer remote directory record may replace a local file at the same path. Do not
+            // follow a symbolic link or replace another special file type.
+            Ok(metadata) if metadata.is_file() => fs::remove_file(&target)
+                .with_context(|| format!("unable to replace shared file {}", target.display()))?,
             Ok(_) => bail!("refusing to replace non-directory {}", target.display()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&target)
-                .with_context(|| format!("unable to create shared directory {}", target.display())),
-            Err(error) => Err(error).with_context(|| {
-                format!("unable to inspect shared directory {}", target.display())
-            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("unable to inspect shared directory {}", target.display())
+                });
+            }
         }
+        fs::create_dir(&target)
+            .with_context(|| format!("unable to create shared directory {}", target.display()))
     })
 }
 
@@ -1225,12 +1232,22 @@ fn write_local_file(
 ) -> Result<()> {
     with_writable_parents(root, manifest_path, true, || {
         let target = safe_local_path(root, manifest_path, true)?;
-        if let Ok(metadata) = fs::symlink_metadata(&target) {
-            if metadata.file_type().is_symlink() {
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
                 bail!("refusing to replace symbolic link {}", target.display());
             }
-            if metadata.is_dir() {
-                bail!("refusing to replace directory {}", target.display());
+            // Descendant tombstones are applied before files, so a newer remote file can replace
+            // an emptied local directory without discarding untracked content.
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir(&target).with_context(|| {
+                format!("unable to replace shared directory {}", target.display())
+            })?,
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => bail!("refusing to replace non-file {}", target.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("unable to inspect shared file {}", target.display())
+                });
             }
         }
         // Transfer staging belongs in the registered share state directory, never in the synced tree.
@@ -1923,7 +1940,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        manifest::{DirectoryEntry, MANIFEST_FORMAT_VERSION, ManifestEntry},
+        manifest::{DirectoryEntry, MANIFEST_FORMAT_VERSION, ManifestEntry, Tombstone},
         types::{ClockState, FORMAT_VERSION, HlcTimestamp, KnownPeers, RuntimeStatus, ShareSecret},
     };
 
@@ -2184,6 +2201,124 @@ mod tests {
         assert_eq!(fs::read(&file).unwrap(), new_bytes);
         assert_eq!(mode(&file), 0o600);
         assert_eq!(mode(&directory), 0o555);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_transfer_replaces_a_file_with_a_directory() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("entry");
+        fs::write(&path, "old file").unwrap();
+        let share_id = ShareId([19; 32]);
+        let local_endpoint = SecretKey::from_bytes(&[20; 32]).public();
+        let remote_endpoint = SecretKey::from_bytes(&[21; 32]).public();
+        let local = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 1,
+            entries: BTreeMap::from([(
+                "entry".to_owned(),
+                file_entry(b"old file", 0o600, timestamp(1, local_endpoint)),
+            )]),
+            directories: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
+        };
+        let share = active_share(&root, local, local_endpoint);
+        let bytes = b"nested file";
+        let remote = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 2,
+            entries: BTreeMap::from([(
+                "entry/config.txt".to_owned(),
+                file_entry(bytes, 0o640, timestamp(3, remote_endpoint)),
+            )]),
+            directories: BTreeMap::from([(
+                "entry".to_owned(),
+                directory_entry(0o750, timestamp(2, remote_endpoint)),
+            )]),
+            tombstones: BTreeMap::new(),
+        };
+        let files = vec![FilePayload {
+            path: "entry/config.txt".to_owned(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+            content: URL_SAFE_NO_PAD.encode(bytes),
+        }];
+
+        let outcome = apply_remote_transfer(&share, &remote, &files).unwrap();
+
+        assert_eq!(outcome.pending_downloads, 0);
+        assert!(path.is_dir());
+        assert_eq!(fs::read(path.join("config.txt")).unwrap(), bytes);
+        assert_eq!(mode(&path), 0o750);
+        assert_eq!(mode(&path.join("config.txt")), 0o640);
+        let stored = share.paths.load_manifest(share_id).unwrap();
+        assert_eq!(stored.entries, remote.entries);
+        assert_eq!(stored.directories, remote.directories);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_transfer_replaces_an_empty_directory_with_a_file() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        let directory = root.join("entry");
+        let nested_file = directory.join("old.txt");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&nested_file, "old nested file").unwrap();
+        let share_id = ShareId([22; 32]);
+        let local_endpoint = SecretKey::from_bytes(&[23; 32]).public();
+        let remote_endpoint = SecretKey::from_bytes(&[24; 32]).public();
+        let local = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 1,
+            entries: BTreeMap::from([(
+                "entry/old.txt".to_owned(),
+                file_entry(b"old nested file", 0o600, timestamp(1, local_endpoint)),
+            )]),
+            directories: BTreeMap::from([(
+                "entry".to_owned(),
+                directory_entry(0o700, timestamp(1, local_endpoint)),
+            )]),
+            tombstones: BTreeMap::new(),
+        };
+        let share = active_share(&root, local, local_endpoint);
+        let bytes = b"replacement file";
+        let remote = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 2,
+            entries: BTreeMap::from([(
+                "entry".to_owned(),
+                file_entry(bytes, 0o640, timestamp(3, remote_endpoint)),
+            )]),
+            directories: BTreeMap::new(),
+            tombstones: BTreeMap::from([(
+                "entry/old.txt".to_owned(),
+                Tombstone {
+                    version: timestamp(2, remote_endpoint),
+                },
+            )]),
+        };
+        let files = vec![FilePayload {
+            path: "entry".to_owned(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+            content: URL_SAFE_NO_PAD.encode(bytes),
+        }];
+
+        let outcome = apply_remote_transfer(&share, &remote, &files).unwrap();
+
+        assert_eq!(outcome.pending_downloads, 0);
+        assert!(directory.is_file());
+        assert_eq!(fs::read(&directory).unwrap(), bytes);
+        assert_eq!(mode(&directory), 0o640);
+        let stored = share.paths.load_manifest(share_id).unwrap();
+        assert_eq!(stored.entries, remote.entries);
+        assert_eq!(stored.directories, remote.directories);
+        assert!(stored.tombstones == remote.tombstones);
     }
 
     #[cfg(unix)]

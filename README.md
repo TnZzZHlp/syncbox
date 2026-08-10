@@ -13,6 +13,12 @@ Syncbox is a Rust command-line application for synchronizing multiple independen
 - On Unix, POSIX permission bits for regular files and subdirectories are synchronized. Ownership,
   ACLs, extended attributes, and the selected shared-root directory's own mode remain local.
 
+## Upgrades
+
+Protocol version 2 peers do not communicate with version 1 peers. Upgrade every peer in a share as
+one maintenance operation: stop the services, install the same version everywhere, then start them
+again.
+
 ## Quick start
 
 Register a directory on the first device:
