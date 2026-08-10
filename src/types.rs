@@ -7,7 +7,12 @@ use rand::Rng as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 pub const FORMAT_VERSION: u16 = 1;
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Wire format used after peer authentication. Version 2 adds POSIX permission metadata for
+/// files and directories, so it deliberately refuses a peer that cannot preserve that metadata.
+pub const PROTOCOL_VERSION: u16 = 2;
+/// ShareTickets only carry credentials and peer addresses. Their version remains stable across
+/// wire-protocol upgrades so an existing ticket can still be used after both peers upgrade.
+pub const TICKET_PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct ShareId(pub [u8; 32]);

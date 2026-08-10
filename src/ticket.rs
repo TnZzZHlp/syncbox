@@ -5,7 +5,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::EndpointId;
 use subtle::ConstantTimeEq as _;
 
-use crate::types::{PROTOCOL_VERSION, ShareId, ShareSecret};
+use crate::types::{ShareId, ShareSecret, TICKET_PROTOCOL_VERSION};
 
 pub const TICKET_PREFIX: &str = "syncbox1:";
 const TICKET_MAGIC: [u8; 4] = *b"SBTK";
@@ -30,7 +30,7 @@ impl ShareTicket {
     ) -> Result<Self> {
         initial_peers.sort_by_key(std::string::ToString::to_string);
         let ticket = Self {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: TICKET_PROTOCOL_VERSION,
             share_id,
             share_secret,
             initial_peers,
@@ -40,7 +40,7 @@ impl ShareTicket {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.protocol_version != PROTOCOL_VERSION {
+        if self.protocol_version != TICKET_PROTOCOL_VERSION {
             bail!(
                 "unsupported ShareTicket protocol version {}",
                 self.protocol_version
@@ -127,7 +127,7 @@ impl ShareTicket {
             bail!("ShareTicket has an unknown format");
         }
         let protocol_version = u16::from_be_bytes(take(&bytes[..content_length], &mut cursor)?);
-        if protocol_version != PROTOCOL_VERSION {
+        if protocol_version != TICKET_PROTOCOL_VERSION {
             bail!("unsupported ShareTicket protocol version {protocol_version}");
         }
         let peer_count = usize::from(u16::from_be_bytes(take(

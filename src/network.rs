@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
@@ -36,7 +37,7 @@ use crate::{
     },
 };
 
-pub const SYNCBOX_ALPN: &[u8] = b"syncbox/1";
+pub const SYNCBOX_ALPN: &[u8] = b"syncbox/2";
 const AUTH_MAGIC: [u8; 4] = *b"SBXA";
 const CLIENT_HELLO_LENGTH: usize = 4 + 2 + 32 + 32 + 32 + 32;
 const SERVER_HELLO_LENGTH: usize = 4 + 2 + 32 + 32 + 32 + 32 + 32;
@@ -784,10 +785,10 @@ fn make_transfer_request(
         let remote_record = ManifestRecordRef::File(remote_entry);
         if matches!(select_record(local.record(path), Some(remote_record)), Some(selected) if selected.version() == remote_record.version() && selected.is_tombstone() == remote_record.is_tombstone())
         {
-            let local_same = local.entries.get(path).is_some_and(|entry| {
-                entry.version == remote_entry.version && entry.sha256 == remote_entry.sha256
+            let local_content_matches = local.entries.get(path).is_some_and(|entry| {
+                entry.size == remote_entry.size && entry.sha256 == remote_entry.sha256
             });
-            if !local_same {
+            if !local_content_matches {
                 download_paths.push(path.clone());
             }
         }
@@ -801,10 +802,10 @@ fn make_transfer_request(
         let local_record = ManifestRecordRef::File(local_entry);
         let selected = select_record(Some(local_record), remote.record(path));
         let local_wins = matches!(selected, Some(winner) if winner.version() == local_record.version() && !winner.is_tombstone());
-        let remote_same = remote.entries.get(path).is_some_and(|entry| {
-            entry.version == local_entry.version && entry.sha256 == local_entry.sha256
+        let remote_content_matches = remote.entries.get(path).is_some_and(|entry| {
+            entry.size == local_entry.size && entry.sha256 == local_entry.sha256
         });
-        if local_wins && !remote_same {
+        if local_wins && !remote_content_matches {
             upload_paths.push(path.clone());
         }
     }
@@ -904,49 +905,102 @@ fn apply_remote_transfer(
     let mut candidate = local.clone();
     let mut pending_downloads = 0_usize;
     let mut applied_records = 0_usize;
-    let all_paths = local
+    let mut all_paths = local
         .all_paths()
         .union(&remote.all_paths())
         .cloned()
         .collect::<Vec<_>>();
-    for path in all_paths {
-        let local_record = local.record(&path);
-        let remote_record = remote.record(&path);
-        let Some(selected) = select_record(local_record, remote_record) else {
-            continue;
-        };
+    all_paths.sort_by(|left, right| {
+        manifest_path_depth(right)
+            .cmp(&manifest_path_depth(left))
+            .then_with(|| right.cmp(left))
+    });
+    for path in &all_paths {
+        let local_record = local.record(path);
+        let remote_record = remote.record(path);
         let selected_remote = remote_record_wins(local_record, remote_record);
         if !selected_remote {
             continue;
         }
-        match selected {
-            ManifestRecordRef::Tombstone(tombstone) => {
-                remove_local_file(&root, &path)?;
-                candidate.entries.remove(&path);
-                candidate.tombstones.insert(path, tombstone.clone());
+        if let Some(ManifestRecordRef::Tombstone(tombstone)) = remote_record {
+            remove_local_path(&root, path)?;
+            candidate.entries.remove(path);
+            candidate.directories.remove(path);
+            candidate.tombstones.insert(path.clone(), tombstone.clone());
+            applied_records = applied_records.saturating_add(1);
+        }
+    }
+
+    all_paths.sort_unstable();
+    let mut directory_permissions = Vec::new();
+    for path in &all_paths {
+        let local_record = local.record(path);
+        let remote_record = remote.record(path);
+        if !remote_record_wins(local_record, remote_record) {
+            continue;
+        }
+        if let Some(ManifestRecordRef::Directory(entry)) = remote_record {
+            ensure_local_directory(&root, path)?;
+            candidate.entries.remove(path);
+            candidate.tombstones.remove(path);
+            candidate.directories.insert(path.clone(), entry.clone());
+            directory_permissions.push((path.clone(), entry.permissions));
+            applied_records = applied_records.saturating_add(1);
+        }
+    }
+
+    for path in &all_paths {
+        let local_record = local.record(path);
+        let remote_record = remote.record(path);
+        if !remote_record_wins(local_record, remote_record) {
+            continue;
+        }
+        if let Some(ManifestRecordRef::File(entry)) = remote_record {
+            if let Some(bytes) = file_data.get(path) {
+                write_local_file(share, &root, path, bytes, entry.permissions)?;
+                candidate.directories.remove(path);
+                candidate.entries.remove(path);
+                candidate.tombstones.remove(path);
+                candidate.entries.insert(path.clone(), entry.clone());
                 applied_records = applied_records.saturating_add(1);
-            }
-            ManifestRecordRef::File(entry) => {
-                if let Some(bytes) = file_data.get(&path) {
-                    write_local_file(share, &root, &path, bytes)?;
-                    candidate.tombstones.remove(&path);
-                    candidate.entries.insert(path, entry.clone());
+            } else {
+                // Metadata-only changes, including chmod, do not need to retransmit unchanged
+                // content. Keep the manifest conservative if the local file disappeared after its
+                // most recent scan.
+                let local_content_matches = local.entries.get(path).is_some_and(|local_entry| {
+                    local_entry.size == entry.size && local_entry.sha256 == entry.sha256
+                });
+                if local_content_matches
+                    && local_file_matches_entry(&root, path, entry.size, &entry.sha256)?
+                {
+                    set_local_file_permissions(&root, path, entry.permissions)?;
+                    candidate.directories.remove(path);
+                    candidate.tombstones.remove(path);
+                    candidate.entries.insert(path.clone(), entry.clone());
                     applied_records = applied_records.saturating_add(1);
                 } else {
-                    // If an exact local file already has the selected version, no payload is needed.
-                    let already_present = local.entries.get(&path).is_some_and(|local_entry| {
-                        local_entry.version == entry.version && local_entry.sha256 == entry.sha256
-                    });
-                    if !already_present {
-                        pending_downloads = pending_downloads.saturating_add(1);
-                    }
+                    pending_downloads = pending_downloads.saturating_add(1);
                 }
             }
         }
     }
+
+    // Apply directory modes after their contents have been created. A remote directory can be
+    // intentionally read-only, so applying it before the file phase could prevent the transfer.
+    directory_permissions.sort_by(|(left, _), (right, _)| {
+        manifest_path_depth(right)
+            .cmp(&manifest_path_depth(left))
+            .then_with(|| right.cmp(left))
+    });
+    for (path, permissions) in directory_permissions {
+        set_local_directory_permissions(&root, &path, permissions)?;
+    }
     candidate.scanned_at_ms = current_time_ms();
     candidate.validate(share.share_id)?;
-    if candidate.entries != local.entries || candidate.tombstones != local.tombstones {
+    if candidate.entries != local.entries
+        || candidate.directories != local.directories
+        || candidate.tombstones != local.tombstones
+    {
         observe_manifest_clock(share, &candidate)?;
         share.paths.save_manifest(&candidate)?;
     }
@@ -976,6 +1030,9 @@ fn observe_manifest_clock(share: &Arc<ActiveShare>, manifest: &Manifest) -> Resu
     let mut clock = share.paths.load_clock(share.share_id)?;
     let now_ms = current_time_ms();
     for entry in manifest.entries.values() {
+        clock.observe(entry.version, now_ms)?;
+    }
+    for entry in manifest.directories.values() {
         clock.observe(entry.version, now_ms)?;
     }
     for tombstone in manifest.tombstones.values() {
@@ -1090,79 +1147,462 @@ fn safe_local_path(root: &Path, manifest_path: &str, writing: bool) -> Result<Pa
     Ok(target)
 }
 
+fn manifest_path_depth(path: &str) -> usize {
+    path.bytes().filter(|byte| *byte == b'/').count() + 1
+}
+
+fn ensure_local_directory(root: &Path, manifest_path: &str) -> Result<()> {
+    with_writable_parents(root, manifest_path, true, || {
+        let target = safe_local_path(root, manifest_path, true)?;
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("refusing to replace symbolic link {}", target.display())
+            }
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(_) => bail!("refusing to replace non-directory {}", target.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&target)
+                .with_context(|| format!("unable to create shared directory {}", target.display())),
+            Err(error) => Err(error).with_context(|| {
+                format!("unable to inspect shared directory {}", target.display())
+            }),
+        }
+    })
+}
+
+fn local_file_matches_entry(
+    root: &Path,
+    manifest_path: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<bool> {
+    with_writable_parents(root, manifest_path, false, || {
+        let target = safe_local_path(root, manifest_path, false)?;
+        let metadata = match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("refusing to use symbolic link {}", target.display())
+            }
+            Ok(metadata) if metadata.is_file() && metadata.len() == expected_size => metadata,
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("unable to inspect shared file {}", target.display())
+                });
+            }
+        };
+        let before_modified = metadata.modified().ok();
+        with_readable_file(&target, || {
+            let mut file = fs::File::open(&target)
+                .with_context(|| format!("unable to read shared file {}", target.display()))?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let count = file
+                    .read(&mut buffer)
+                    .with_context(|| format!("unable to read shared file {}", target.display()))?;
+                if count == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..count]);
+            }
+            let after = file
+                .metadata()
+                .with_context(|| format!("unable to inspect shared file {}", target.display()))?;
+            Ok(after.is_file()
+                && after.len() == expected_size
+                && after.modified().ok() == before_modified
+                && hex::encode(hasher.finalize()) == expected_sha256)
+        })
+    })
+}
+
 fn write_local_file(
     share: &Arc<ActiveShare>,
     root: &Path,
     manifest_path: &str,
     bytes: &[u8],
+    permissions: Option<u16>,
 ) -> Result<()> {
-    let target = safe_local_path(root, manifest_path, true)?;
-    if let Ok(metadata) = fs::symlink_metadata(&target) {
-        if metadata.file_type().is_symlink() {
-            bail!("refusing to replace symbolic link {}", target.display());
-        }
-        if metadata.is_dir() {
-            bail!("refusing to replace directory {}", target.display());
-        }
-    }
-    // Transfer staging belongs in the registered share state directory, never in the synced tree.
-    let temp = share.paths.share_tmp_dir(share.share_id).join(format!(
-        "transfer-{}-{}.tmp",
-        std::process::id(),
-        rand::rng().random::<u64>()
-    ));
-    let result = (|| -> Result<()> {
-        fs::write(&temp, bytes)
-            .with_context(|| format!("unable to stage downloaded file {}", temp.display()))?;
-        match fs::rename(&temp, &target) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
-                // Application data and the shared directory may live on separate volumes. Fall
-                // back to a direct replacement rather than creating a program temporary file in
-                // the shared tree.
-                fs::write(&target, bytes).with_context(|| {
-                    format!("unable to install downloaded file {}", target.display())
-                })?;
-                fs::remove_file(&temp).with_context(|| {
-                    format!("unable to remove transfer staging file {}", temp.display())
-                })?;
-                Ok(())
+    with_writable_parents(root, manifest_path, true, || {
+        let target = safe_local_path(root, manifest_path, true)?;
+        if let Ok(metadata) = fs::symlink_metadata(&target) {
+            if metadata.file_type().is_symlink() {
+                bail!("refusing to replace symbolic link {}", target.display());
             }
-            Err(_) if cfg!(windows) && target.exists() => {
-                // Windows rename does not consistently replace an existing file across supported
-                // filesystems. The target has already been checked not to be a symlink or directory.
-                fs::remove_file(&target).with_context(|| {
-                    format!("unable to replace downloaded file {}", target.display())
-                })?;
-                fs::rename(&temp, &target).with_context(|| {
-                    format!("unable to install downloaded file {}", target.display())
-                })
+            if metadata.is_dir() {
+                bail!("refusing to replace directory {}", target.display());
             }
-            Err(error) => Err(error)
-                .with_context(|| format!("unable to install downloaded file {}", target.display())),
         }
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+        // Transfer staging belongs in the registered share state directory, never in the synced tree.
+        let temp = share.paths.share_tmp_dir(share.share_id).join(format!(
+            "transfer-{}-{}.tmp",
+            std::process::id(),
+            rand::rng().random::<u64>()
+        ));
+        let result = (|| -> Result<()> {
+            fs::write(&temp, bytes)
+                .with_context(|| format!("unable to stage downloaded file {}", temp.display()))?;
+            match fs::rename(&temp, &target) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+                    // Application data and the shared directory may live on separate volumes. Fall
+                    // back to a direct replacement rather than creating a program temporary file in
+                    // the shared tree.
+                    write_cross_device_target(&target, bytes, permissions)?;
+                    fs::remove_file(&temp).with_context(|| {
+                        format!("unable to remove transfer staging file {}", temp.display())
+                    })?;
+                    Ok(())
+                }
+                Err(_) if cfg!(windows) && target.exists() => {
+                    // Windows rename does not consistently replace an existing file across supported
+                    // filesystems. The target has already been checked not to be a symlink or directory.
+                    fs::remove_file(&target).with_context(|| {
+                        format!("unable to replace downloaded file {}", target.display())
+                    })?;
+                    fs::rename(&temp, &target).with_context(|| {
+                        format!("unable to install downloaded file {}", target.display())
+                    })
+                }
+                Err(error) => Err(error).with_context(|| {
+                    format!("unable to install downloaded file {}", target.display())
+                }),
+            }
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result?;
+        set_local_file_permissions(root, manifest_path, permissions)
+    })
 }
 
-fn remove_local_file(root: &Path, manifest_path: &str) -> Result<()> {
-    let target = safe_local_path(root, manifest_path, false)?;
-    match fs::symlink_metadata(&target) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!("refusing to delete symbolic link {}", target.display())
+fn remove_local_path(root: &Path, manifest_path: &str) -> Result<()> {
+    with_writable_parents(root, manifest_path, false, || {
+        let target = safe_local_path(root, manifest_path, false)?;
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("refusing to delete symbolic link {}", target.display())
+            }
+            Ok(metadata) if metadata.is_file() => fs::remove_file(&target)
+                .with_context(|| format!("unable to remove shared file {}", target.display())),
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir(&target).with_context(|| {
+                format!(
+                    "unable to remove empty shared directory {}",
+                    target.display()
+                )
+            }),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("unable to inspect {}", target.display()))
+            }
         }
-        Ok(metadata) if metadata.is_file() => fs::remove_file(&target)
-            .with_context(|| format!("unable to remove shared file {}", target.display())),
-        Ok(metadata) if metadata.is_dir() => {
-            bail!("refusing to delete directory {}", target.display())
+    })
+}
+
+fn set_local_file_permissions(
+    root: &Path,
+    manifest_path: &str,
+    permissions: Option<u16>,
+) -> Result<()> {
+    let Some(permissions) = permissions else {
+        return Ok(());
+    };
+    with_writable_parents(root, manifest_path, false, || {
+        let target = safe_local_path(root, manifest_path, false)?;
+        set_permissions(&target, permissions, false)
+    })
+}
+
+fn set_local_directory_permissions(
+    root: &Path,
+    manifest_path: &str,
+    permissions: Option<u16>,
+) -> Result<()> {
+    let Some(permissions) = permissions else {
+        return Ok(());
+    };
+    with_writable_parents(root, manifest_path, false, || {
+        let target = safe_local_path(root, manifest_path, false)?;
+        set_permissions(&target, permissions, true)
+    })
+}
+
+#[cfg(unix)]
+struct PermissionRestore {
+    path: PathBuf,
+    permissions: u32,
+}
+
+#[cfg(unix)]
+fn with_writable_parents<T>(
+    root: &Path,
+    manifest_path: &str,
+    create_missing_parents: bool,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    validate_manifest_path(manifest_path)?;
+    let mut restores = Vec::new();
+    let preparation = (|| -> Result<()> {
+        prepare_directory_for_write(root, true, &mut restores)?;
+        let components = manifest_path.split('/').collect::<Vec<_>>();
+        let mut parent = root.to_path_buf();
+        for component in &components[..components.len().saturating_sub(1)] {
+            parent.push(component);
+            match fs::symlink_metadata(&parent) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    bail!("shared path contains a symbolic link: {}", parent.display())
+                }
+                Ok(metadata) if !metadata.is_dir() => {
+                    bail!(
+                        "shared path parent is not a directory: {}",
+                        parent.display()
+                    )
+                }
+                Ok(_) => prepare_directory_for_write(&parent, true, &mut restores)?,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound && create_missing_parents =>
+                {
+                    fs::create_dir(&parent).with_context(|| {
+                        format!("unable to create shared directory {}", parent.display())
+                    })?;
+                    prepare_directory_for_write(&parent, false, &mut restores)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("unable to inspect {}", parent.display()));
+                }
+            }
         }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("unable to inspect {}", target.display())),
+        Ok(())
+    })();
+    if let Err(error) = preparation {
+        let _ = restore_parent_permissions(restores);
+        return Err(error);
     }
+    let result = operation();
+    let restore_result = restore_parent_permissions(restores);
+    match (result, restore_result) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+#[cfg(unix)]
+fn restore_parent_permissions(restores: Vec<PermissionRestore>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    restores.into_iter().rev().try_for_each(|restore| {
+        fs::set_permissions(
+            &restore.path,
+            fs::Permissions::from_mode(restore.permissions),
+        )
+        .with_context(|| {
+            format!(
+                "unable to restore permissions on shared directory {}",
+                restore.path.display()
+            )
+        })
+    })
+}
+
+#[cfg(unix)]
+fn prepare_directory_for_write(
+    path: &Path,
+    restore_existing_permissions: bool,
+    restores: &mut Vec<PermissionRestore>,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("unable to inspect shared directory {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("shared path contains a symbolic link: {}", path.display());
+    }
+    if !metadata.is_dir() {
+        bail!("shared path parent is not a directory: {}", path.display());
+    }
+    let permissions = metadata.permissions().mode() & 0o7777;
+    if permissions & 0o300 == 0o300 {
+        return Ok(());
+    }
+    match fs::set_permissions(path, fs::Permissions::from_mode(permissions | 0o300)) {
+        Ok(()) => {
+            if restore_existing_permissions {
+                restores.push(PermissionRestore {
+                    path: path.to_path_buf(),
+                    permissions,
+                });
+            }
+        }
+        Err(_error) if directory_mode_allows_non_owner_writes(permissions) => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "unable to make shared directory writable {}",
+                    path.display()
+                )
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn directory_mode_allows_non_owner_writes(permissions: u32) -> bool {
+    [0o030, 0o003]
+        .into_iter()
+        .any(|required| permissions & required == required)
+}
+
+#[cfg(not(unix))]
+fn with_writable_parents<T>(
+    _root: &Path,
+    _manifest_path: &str,
+    _create_missing_parents: bool,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    operation()
+}
+
+#[cfg(unix)]
+fn with_readable_file<T>(target: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = fs::symlink_metadata(target)
+        .with_context(|| format!("unable to inspect shared file {}", target.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("refusing to read symbolic link {}", target.display());
+    }
+    if !metadata.is_file() {
+        bail!("shared path is not a regular file: {}", target.display());
+    }
+    let permissions = metadata.permissions().mode() & 0o7777;
+    let restore_permissions = if permissions & 0o400 == 0 {
+        match fs::set_permissions(target, fs::Permissions::from_mode(permissions | 0o400)) {
+            Ok(()) => Some(permissions),
+            Err(_) if permissions & 0o044 != 0 => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("unable to make shared file readable {}", target.display())
+                });
+            }
+        }
+    } else {
+        None
+    };
+    let result = operation();
+    let restore_result = if let Some(permissions) = restore_permissions {
+        fs::set_permissions(target, fs::Permissions::from_mode(permissions)).with_context(|| {
+            format!(
+                "unable to restore permissions on shared file {}",
+                target.display()
+            )
+        })
+    } else {
+        Ok(())
+    };
+    match (result, restore_result) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+#[cfg(not(unix))]
+fn with_readable_file<T>(_target: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    operation()
+}
+
+#[cfg(unix)]
+fn set_permissions(target: &Path, permissions: u16, directory: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = fs::symlink_metadata(target)
+        .with_context(|| format!("unable to inspect shared path {}", target.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to change permissions on symbolic link {}",
+            target.display()
+        );
+    }
+    if directory != metadata.is_dir() || (!directory && !metadata.is_file()) {
+        bail!("shared path has an unexpected type: {}", target.display());
+    }
+    fs::set_permissions(target, fs::Permissions::from_mode(u32::from(permissions)))
+        .with_context(|| format!("unable to set permissions on {}", target.display()))
+}
+
+#[cfg(not(unix))]
+fn set_permissions(_target: &Path, _permissions: u16, _directory: bool) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_cross_device_target(
+    target: &Path,
+    bytes: &[u8],
+    final_permissions: Option<u16>,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let restore_permissions = match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("refusing to replace symbolic link {}", target.display())
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            bail!("refusing to replace non-file {}", target.display())
+        }
+        Ok(metadata) => {
+            let permissions = metadata.permissions().mode() & 0o7777;
+            if permissions & 0o200 == 0 {
+                match fs::set_permissions(target, fs::Permissions::from_mode(permissions | 0o200)) {
+                    Ok(()) => Some(permissions),
+                    Err(_) if permissions & 0o022 != 0 => None,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("unable to make shared file writable {}", target.display())
+                        });
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("unable to inspect shared file {}", target.display()));
+        }
+    };
+    let write_result = fs::write(target, bytes)
+        .with_context(|| format!("unable to install downloaded file {}", target.display()));
+    if (write_result.is_err() || final_permissions.is_none())
+        && let Some(permissions) = restore_permissions
+    {
+        fs::set_permissions(target, fs::Permissions::from_mode(permissions)).with_context(
+            || {
+                format!(
+                    "unable to restore permissions on shared file {}",
+                    target.display()
+                )
+            },
+        )?;
+    }
+    write_result
+}
+
+#[cfg(not(unix))]
+fn write_cross_device_target(
+    target: &Path,
+    bytes: &[u8],
+    _final_permissions: Option<u16>,
+) -> Result<()> {
+    fs::write(target, bytes)
+        .with_context(|| format!("unable to install downloaded file {}", target.display()))
 }
 
 fn update_runtime<F>(share: &Arc<ActiveShare>, update: F) -> Result<()>
@@ -1474,10 +1914,18 @@ async fn read_json_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
+
     use iroh::SecretKey;
+    use tempfile::TempDir;
 
     use super::*;
-    use crate::types::{FORMAT_VERSION, ShareSecret};
+    use crate::{
+        manifest::{DirectoryEntry, MANIFEST_FORMAT_VERSION, ManifestEntry},
+        types::{ClockState, FORMAT_VERSION, HlcTimestamp, KnownPeers, RuntimeStatus, ShareSecret},
+    };
 
     fn config() -> (ShareConfig, EndpointId, EndpointId) {
         let client = SecretKey::from_bytes(&[1; 32]).public();
@@ -1505,5 +1953,248 @@ mod tests {
         let mut other = config;
         other.share_id = ShareId([8; 32]);
         assert_ne!(proof, client_proof(&other, &client, &server, [7; 32]));
+    }
+
+    #[cfg(unix)]
+    fn active_share(root: &Path, manifest: Manifest, endpoint: EndpointId) -> Arc<ActiveShare> {
+        let paths = DataPaths::from_root(root.parent().unwrap().join("state"));
+        let config = ShareConfig {
+            format_version: FORMAT_VERSION,
+            share_id: manifest.share_id,
+            share_secret: ShareSecret::from_bytes([9; 32]),
+            name: "test".to_owned(),
+            local_directory: root.to_string_lossy().into_owned(),
+            created_at_ms: 0,
+            initial_peers: Vec::new(),
+            initial_sync_complete: true,
+        };
+        paths
+            .create_share_state(
+                &config,
+                &manifest,
+                &ClockState::new(),
+                &KnownPeers::empty(),
+                &RuntimeStatus::stopped(0),
+            )
+            .unwrap();
+        Arc::new(ActiveShare {
+            paths,
+            share_id: manifest.share_id,
+            config: Arc::new(RwLock::new(config)),
+            operation_lock: Arc::new(Mutex::new(())),
+            status_lock: Arc::new(std::sync::Mutex::new(())),
+            local_endpoint_id: endpoint,
+        })
+    }
+
+    #[cfg(unix)]
+    fn timestamp(wall_ms: u64, endpoint: EndpointId) -> HlcTimestamp {
+        HlcTimestamp {
+            wall_ms,
+            counter: 0,
+            author: *endpoint.as_bytes(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn file_entry(bytes: &[u8], permissions: u16, version: HlcTimestamp) -> ManifestEntry {
+        ManifestEntry {
+            size: bytes.len() as u64,
+            modified_at_ns: 0,
+            sha256: hex::encode(Sha256::digest(bytes)),
+            permissions: Some(permissions),
+            version,
+        }
+    }
+
+    #[cfg(unix)]
+    fn directory_entry(permissions: u16, version: HlcTimestamp) -> DirectoryEntry {
+        DirectoryEntry {
+            permissions: Some(permissions),
+            version,
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u16 {
+        (fs::metadata(path).unwrap().permissions().mode() & 0o7777) as u16
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_transfer_applies_file_and_directory_permissions() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+        let share_id = ShareId([10; 32]);
+        let local_endpoint = SecretKey::from_bytes(&[11; 32]).public();
+        let remote_endpoint = SecretKey::from_bytes(&[12; 32]).public();
+        let share = active_share(&root, Manifest::empty(share_id, 0), local_endpoint);
+        let bytes = b"secret";
+        let remote = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 2,
+            entries: BTreeMap::from([(
+                "private/config.txt".to_owned(),
+                file_entry(bytes, 0o640, timestamp(2, remote_endpoint)),
+            )]),
+            directories: BTreeMap::from([
+                (
+                    "empty".to_owned(),
+                    directory_entry(0o710, timestamp(1, remote_endpoint)),
+                ),
+                (
+                    "private".to_owned(),
+                    directory_entry(0o750, timestamp(1, remote_endpoint)),
+                ),
+            ]),
+            tombstones: BTreeMap::new(),
+        };
+        let files = vec![FilePayload {
+            path: "private/config.txt".to_owned(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+            content: URL_SAFE_NO_PAD.encode(bytes),
+        }];
+
+        let outcome = apply_remote_transfer(&share, &remote, &files).unwrap();
+        assert_eq!(outcome.pending_downloads, 0);
+        assert_eq!(fs::read(root.join("private/config.txt")).unwrap(), bytes);
+        assert_eq!(mode(&root.join("private/config.txt")), 0o640);
+        assert_eq!(mode(&root.join("private")), 0o750);
+        assert_eq!(mode(&root.join("empty")), 0o710);
+        let stored = share.paths.load_manifest(share_id).unwrap();
+        assert_eq!(stored.entries, remote.entries);
+        assert_eq!(stored.directories, remote.directories);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_only_permission_updates_do_not_need_file_payloads() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        let directory = root.join("private");
+        let file = directory.join("config.txt");
+        fs::create_dir_all(&directory).unwrap();
+        let bytes = b"same content";
+        fs::write(&file, bytes).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        let share_id = ShareId([13; 32]);
+        let local_endpoint = SecretKey::from_bytes(&[14; 32]).public();
+        let remote_endpoint = SecretKey::from_bytes(&[15; 32]).public();
+        let local = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 1,
+            entries: BTreeMap::from([(
+                "private/config.txt".to_owned(),
+                file_entry(bytes, 0o000, timestamp(1, local_endpoint)),
+            )]),
+            directories: BTreeMap::from([(
+                "private".to_owned(),
+                directory_entry(0o755, timestamp(1, local_endpoint)),
+            )]),
+            tombstones: BTreeMap::new(),
+        };
+        let share = active_share(&root, local.clone(), local_endpoint);
+        let remote = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 2,
+            entries: BTreeMap::from([(
+                "private/config.txt".to_owned(),
+                file_entry(bytes, 0o600, timestamp(2, remote_endpoint)),
+            )]),
+            directories: BTreeMap::from([(
+                "private".to_owned(),
+                directory_entry(0o700, timestamp(2, remote_endpoint)),
+            )]),
+            tombstones: BTreeMap::new(),
+        };
+        let (transfer, pending_updates) = make_transfer_request(&share, &local, &remote).unwrap();
+        assert_eq!(pending_updates, 0);
+        assert!(transfer.download_paths.is_empty());
+        assert!(transfer.files.is_empty());
+
+        let outcome = apply_remote_transfer(&share, &remote, &[]).unwrap();
+        assert_eq!(outcome.pending_downloads, 0);
+        assert_eq!(fs::read(&file).unwrap(), bytes);
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&directory), 0o700);
+        let stored = share.paths.load_manifest(share_id).unwrap();
+        assert_eq!(stored.entries, remote.entries);
+        assert_eq!(stored.directories, remote.directories);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_updates_work_inside_a_previously_read_only_directory() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        let directory = root.join("private");
+        let file = directory.join("config.txt");
+        fs::create_dir_all(&directory).unwrap();
+        let old_bytes = b"old";
+        let new_bytes = b"new";
+        fs::write(&file, old_bytes).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+        let share_id = ShareId([16; 32]);
+        let local_endpoint = SecretKey::from_bytes(&[17; 32]).public();
+        let remote_endpoint = SecretKey::from_bytes(&[18; 32]).public();
+        let directory_version = timestamp(1, remote_endpoint);
+        let local = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 1,
+            entries: BTreeMap::from([(
+                "private/config.txt".to_owned(),
+                file_entry(old_bytes, 0o444, timestamp(1, local_endpoint)),
+            )]),
+            directories: BTreeMap::from([(
+                "private".to_owned(),
+                directory_entry(0o555, directory_version),
+            )]),
+            tombstones: BTreeMap::new(),
+        };
+        let share = active_share(&root, local, local_endpoint);
+        let remote = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 2,
+            entries: BTreeMap::from([(
+                "private/config.txt".to_owned(),
+                file_entry(new_bytes, 0o600, timestamp(2, remote_endpoint)),
+            )]),
+            directories: BTreeMap::from([(
+                "private".to_owned(),
+                directory_entry(0o555, directory_version),
+            )]),
+            tombstones: BTreeMap::new(),
+        };
+        let files = vec![FilePayload {
+            path: "private/config.txt".to_owned(),
+            sha256: hex::encode(Sha256::digest(new_bytes)),
+            content: URL_SAFE_NO_PAD.encode(new_bytes),
+        }];
+
+        let outcome = apply_remote_transfer(&share, &remote, &files).unwrap();
+        assert_eq!(outcome.pending_downloads, 0);
+        assert_eq!(fs::read(&file).unwrap(), new_bytes);
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&directory), 0o555);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_missing_nested_path_does_not_create_parent_directories() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+
+        remove_local_path(&root, "missing/config.txt").unwrap();
+
+        assert!(!root.join("missing").exists());
     }
 }
