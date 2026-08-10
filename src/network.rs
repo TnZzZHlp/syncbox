@@ -335,9 +335,11 @@ async fn run_sync_cycle(endpoint: &Endpoint, registry: &ShareRegistry) {
 }
 
 async fn sync_active_share(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Result<()> {
-    let _operation_lock = share.operation_lock.lock().await;
     let config = share.config()?;
     if config.initial_sync_complete {
+        // Protect only local state changes. Never hold this lock while waiting for a remote
+        // response: two peers can legitimately dial each other at the same time.
+        let _operation_lock = share.operation_lock.lock().await;
         scan_and_save(share, &config)?;
     }
     sync_known_peers(endpoint, share).await.map(|_| ())
@@ -346,6 +348,7 @@ async fn sync_active_share(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Res
 #[derive(Default)]
 struct SyncOutcome {
     connected: bool,
+    connected_peers: usize,
     pending_downloads: usize,
     pending_updates: usize,
 }
@@ -388,6 +391,7 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
             timeout(SYNC_EXCHANGE_TIMEOUT, sync_with_peer(endpoint, share, peer)).await
         {
             outcome.connected = true;
+            outcome.connected_peers = outcome.connected_peers.saturating_add(1);
             outcome.pending_downloads = outcome
                 .pending_downloads
                 .saturating_add(peer_outcome.pending_downloads);
@@ -415,7 +419,7 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
         update_runtime(share, |status, now_ms| {
             status.state = state;
             status.health = health;
-            status.connected_peers = 0;
+            status.connected_peers = outcome.connected_peers;
             status.pending_downloads = outcome.pending_downloads;
             status.pending_updates = outcome.pending_updates;
             status.last_sync_at_ms = Some(now_ms);
@@ -490,30 +494,41 @@ async fn sync_with_peer(
     let response: SyncResponse = read_json_frame(&mut recv).await?;
     validate_sync_response(&response, share.share_id)?;
 
-    merge_remote_peers(share, response.known_peers.iter(), Some(expected_peer))?;
-    let (transfer, pending_updates) =
-        make_transfer_request(share, &outbound_manifest, &response.manifest)?;
+    {
+        let _operation_lock = share.operation_lock.lock().await;
+        merge_remote_peers(share, response.known_peers.iter(), Some(expected_peer))?;
+    }
+    let (transfer, pending_updates) = {
+        let _operation_lock = share.operation_lock.lock().await;
+        make_transfer_request(share, &outbound_manifest, &response.manifest)?
+    };
     write_json_frame(&mut send, &transfer).await?;
     send.finish()
         .context("unable to finish sync request stream")?;
     let final_response: TransferResponse = read_json_frame(&mut recv).await?;
     validate_transfer_response(&final_response, share.share_id)?;
-    let applied = apply_remote_transfer(share, &final_response.manifest, &final_response.files)?;
-    if applied.applied_records > 0 {
-        update_runtime(share, |status, now_ms| {
-            status.last_remote_update_at_ms = Some(now_ms);
-        })?;
-    }
+    let applied = {
+        let _operation_lock = share.operation_lock.lock().await;
+        let applied =
+            apply_remote_transfer(share, &final_response.manifest, &final_response.files)?;
+        if applied.applied_records > 0 {
+            update_runtime(share, |status, now_ms| {
+                status.last_remote_update_at_ms = Some(now_ms);
+            })?;
+        }
 
-    let mut updated_config = share.config()?;
-    if !updated_config.initial_sync_complete && applied.pending_downloads == 0 {
-        updated_config.initial_sync_complete = true;
-        share.paths.save_config(&updated_config)?;
-        share.replace_config(updated_config.clone())?;
-        // Only scan after the remote snapshot has been applied. Remote entries retain their
-        // version, while files that existed only in the join target receive fresh local versions.
-        scan_and_save(share, &updated_config)?;
-    }
+        let mut updated_config = share.config()?;
+        if !updated_config.initial_sync_complete && applied.pending_downloads == 0 {
+            updated_config.initial_sync_complete = true;
+            share.paths.save_config(&updated_config)?;
+            share.replace_config(updated_config.clone())?;
+            // Only scan after the remote snapshot has been applied. Remote entries retain their
+            // version, while files that existed only in the join target receive fresh local
+            // versions.
+            scan_and_save(share, &updated_config)?;
+        }
+        applied
+    };
     connection.close(0_u8.into(), b"sync complete");
     Ok(PeerSyncOutcome {
         pending_downloads: applied.pending_downloads,
@@ -539,7 +554,6 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
         &connection.remote_id(),
         &share.local_endpoint_id,
     )?;
-    let _operation_lock = share.operation_lock.lock().await;
     let server_nonce: [u8; 32] = rand::rng().random();
     let server_hello = make_server_hello(
         &config,
@@ -554,13 +568,17 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
 
     let request: SyncRequest = read_json_frame(&mut recv).await?;
     validate_sync_request(&request, share.share_id)?;
-    merge_remote_peers(
-        &share,
-        request.known_peers.iter(),
-        Some(connection.remote_id()),
-    )?;
-    let local_manifest = share.paths.load_manifest(share.share_id)?;
-    let known_peers = known_peer_strings(&share, &connection.remote_id())?;
+    let (local_manifest, known_peers) = {
+        let _operation_lock = share.operation_lock.lock().await;
+        merge_remote_peers(
+            &share,
+            request.known_peers.iter(),
+            Some(connection.remote_id()),
+        )?;
+        let local_manifest = share.paths.load_manifest(share.share_id)?;
+        let known_peers = known_peer_strings(&share, &connection.remote_id())?;
+        (local_manifest, known_peers)
+    };
     write_json_frame(
         &mut send,
         &SyncResponse {
@@ -574,9 +592,13 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
 
     let transfer: TransferRequest = read_json_frame(&mut recv).await?;
     validate_transfer_request(&transfer, share.share_id)?;
-    let applied = apply_remote_transfer(&share, &transfer.manifest, &transfer.files)?;
-    let final_manifest = share.paths.load_manifest(share.share_id)?;
-    let files = build_file_payloads(&share, &final_manifest, &transfer.download_paths)?;
+    let (applied, final_manifest, files) = {
+        let _operation_lock = share.operation_lock.lock().await;
+        let applied = apply_remote_transfer(&share, &transfer.manifest, &transfer.files)?;
+        let final_manifest = share.paths.load_manifest(share.share_id)?;
+        let files = build_file_payloads(&share, &final_manifest, &transfer.download_paths)?;
+        (applied, final_manifest, files)
+    };
     write_json_frame(
         &mut send,
         &TransferResponse {
