@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::Read,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
@@ -42,8 +42,7 @@ const AUTH_MAGIC: [u8; 4] = *b"SBXA";
 const CLIENT_HELLO_LENGTH: usize = 4 + 2 + 32 + 32 + 32 + 32;
 const SERVER_HELLO_LENGTH: usize = 4 + 2 + 32 + 32 + 32 + 32 + 32;
 const MAX_CONTROL_FRAME_BYTES: usize = 96 * 1024 * 1024;
-const MAX_TRANSFER_FILE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_TRANSFER_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_TRANSFER_FILES: usize = 256;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const SYNC_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -504,14 +503,16 @@ async fn sync_with_peer(
         make_transfer_request(share, &outbound_manifest, &response.manifest)?
     };
     write_json_frame(&mut send, &transfer).await?;
-    send.finish()
-        .context("unable to finish sync request stream")?;
+    let ready: TransferReady = read_json_frame(&mut recv).await?;
+    validate_transfer_ready(&ready, share.share_id, &transfer.uploads)?;
+    send_upload_chunks(share, &transfer.uploads, &ready.uploads, &mut send).await?;
+    send.finish().context("unable to finish upload stream")?;
     let final_response: TransferResponse = read_json_frame(&mut recv).await?;
     validate_transfer_response(&final_response, share.share_id)?;
+    let completed = receive_download_chunks(share, &final_response.files, &mut recv).await?;
     let applied = {
         let _operation_lock = share.operation_lock.lock().await;
-        let applied =
-            apply_remote_transfer(share, &final_response.manifest, &final_response.files)?;
+        let applied = apply_remote_staged_transfer(share, &final_response.manifest, &completed)?;
         if applied.applied_records > 0 {
             update_runtime(share, |status, now_ms| {
                 status.last_remote_update_at_ms = Some(now_ms);
@@ -585,7 +586,7 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
         &SyncResponse {
             protocol_version: PROTOCOL_VERSION,
             share_id: share.share_id,
-            manifest: local_manifest,
+            manifest: local_manifest.clone(),
             known_peers,
         },
     )
@@ -593,11 +594,25 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
 
     let transfer: TransferRequest = read_json_frame(&mut recv).await?;
     validate_transfer_request(&transfer, share.share_id)?;
+    let ready = make_transfer_ready(&share, &transfer)?;
+    write_json_frame(&mut send, &ready).await?;
+    let uploaded = receive_upload_chunks(
+        &share,
+        share.share_id,
+        &transfer.uploads,
+        &ready.uploads,
+        &mut recv,
+    )
+    .await?;
     let (applied, final_manifest, files) = {
         let _operation_lock = share.operation_lock.lock().await;
-        let applied = apply_remote_transfer(&share, &transfer.manifest, &transfer.files)?;
+        let applied = apply_remote_staged_transfer(&share, &transfer.manifest, &uploaded)?;
         let final_manifest = share.paths.load_manifest(share.share_id)?;
-        let files = build_file_payloads(&share, &final_manifest, &transfer.download_paths)?;
+        let files = build_transfer_files(
+            &final_manifest,
+            &transfer.download_paths,
+            &transfer.download_resumes,
+        )?;
         (applied, final_manifest, files)
     };
     write_json_frame(
@@ -606,10 +621,11 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
             protocol_version: PROTOCOL_VERSION,
             share_id: share.share_id,
             manifest: final_manifest,
-            files,
+            files: files.clone(),
         },
     )
     .await?;
+    send_file_chunks_from_root(&share, &files, &mut send).await?;
     send.finish()
         .context("unable to finish sync response stream")?;
     // Keep the connection alive until the client has acknowledged the final response. Dropping an
@@ -650,7 +666,16 @@ struct TransferRequest {
     share_id: ShareId,
     manifest: Manifest,
     download_paths: Vec<String>,
-    files: Vec<FilePayload>,
+    download_resumes: Vec<TransferFile>,
+    uploads: Vec<TransferFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransferReady {
+    protocol_version: u16,
+    share_id: ShareId,
+    uploads: Vec<TransferFile>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -659,9 +684,28 @@ struct TransferResponse {
     protocol_version: u16,
     share_id: ShareId,
     manifest: Manifest,
-    files: Vec<FilePayload>,
+    files: Vec<TransferFile>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransferFile {
+    path: String,
+    sha256: String,
+    size: u64,
+    offset: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChunkFrame {
+    path: String,
+    sha256: String,
+    offset: u64,
+    content: String,
+}
+
+#[allow(dead_code)]
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FilePayload {
@@ -692,7 +736,38 @@ fn validate_transfer_request(request: &TransferRequest, share_id: ShareId) -> Re
     }
     request.manifest.validate(share_id)?;
     validate_path_list(&request.download_paths)?;
-    validate_file_payloads(&request.files, &request.manifest)
+    validate_transfer_files(&request.uploads, &request.manifest)?;
+    validate_transfer_file_shapes(&request.download_resumes)?;
+    let requested_downloads = request.download_paths.iter().collect::<HashSet<_>>();
+    for resume in &request.download_resumes {
+        if !requested_downloads.contains(&resume.path) {
+            bail!("network transfer resume path was not requested");
+        }
+    }
+    Ok(())
+}
+
+fn validate_transfer_ready(
+    ready: &TransferReady,
+    share_id: ShareId,
+    requested: &[TransferFile],
+) -> Result<()> {
+    if ready.protocol_version != PROTOCOL_VERSION || ready.share_id != share_id {
+        bail!("file transfer ready message has an incompatible protocol or share ID");
+    }
+    validate_transfer_file_shapes(&ready.uploads)?;
+    if ready.uploads.len() != requested.len() {
+        bail!("file transfer ready message has an unexpected upload count");
+    }
+    for (actual, expected) in ready.uploads.iter().zip(requested) {
+        if actual.path != expected.path
+            || actual.sha256 != expected.sha256
+            || actual.size != expected.size
+        {
+            bail!("file transfer ready message does not match the request");
+        }
+    }
+    Ok(())
 }
 
 fn validate_transfer_response(response: &TransferResponse, share_id: ShareId) -> Result<()> {
@@ -700,7 +775,49 @@ fn validate_transfer_response(response: &TransferResponse, share_id: ShareId) ->
         bail!("file transfer response has an incompatible protocol or share ID");
     }
     response.manifest.validate(share_id)?;
-    validate_file_payloads(&response.files, &response.manifest)
+    validate_transfer_files(&response.files, &response.manifest)
+}
+
+fn validate_transfer_file_shapes(files: &[TransferFile]) -> Result<()> {
+    if files.len() > MAX_TRANSFER_FILES {
+        bail!("network transfer contains too many files");
+    }
+    let mut unique = HashSet::new();
+    for file in files {
+        validate_manifest_path(&file.path)?;
+        validate_sha256(&file.sha256)?;
+        if file.offset > file.size {
+            bail!("network transfer resume offset exceeds file size");
+        }
+        if !unique.insert(&file.path) {
+            bail!("network transfer contains duplicate file paths");
+        }
+    }
+    Ok(())
+}
+
+fn validate_transfer_files(files: &[TransferFile], manifest: &Manifest) -> Result<()> {
+    validate_transfer_file_shapes(files)?;
+    for file in files {
+        let entry = manifest
+            .entries
+            .get(&file.path)
+            .ok_or_else(|| anyhow!("network transfer file is not present in its manifest"))?;
+        if entry.sha256 != file.sha256 || entry.size != file.size {
+            bail!("network transfer file metadata does not match its manifest");
+        }
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str) -> Result<()> {
+    if value.len() != 64
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || value.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        bail!("network transfer hash must be 64 lowercase hexadecimal characters");
+    }
+    Ok(())
 }
 
 fn validate_wire_peers(peers: &[String]) -> Result<()> {
@@ -731,11 +848,11 @@ fn validate_path_list(paths: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn validate_file_payloads(files: &[FilePayload], manifest: &Manifest) -> Result<()> {
     if files.len() > MAX_TRANSFER_FILES {
         bail!("network transfer contains too many files");
     }
-    let mut total = 0_usize;
     let mut unique = HashSet::new();
     for file in files {
         validate_manifest_path(&file.path)?;
@@ -749,27 +866,18 @@ fn validate_file_payloads(files: &[FilePayload], manifest: &Manifest) -> Result<
         if entry.sha256 != file.sha256 {
             bail!("network file hash does not match its manifest");
         }
-        if file.content.len() > MAX_TRANSFER_FILE_BYTES.saturating_mul(2) {
-            bail!("network file payload is too large");
-        }
         let data = URL_SAFE_NO_PAD
             .decode(&file.content)
             .map_err(|_| anyhow!("network file payload is not valid base64url"))?;
         if URL_SAFE_NO_PAD.encode(&data) != file.content {
             bail!("network file payload must use canonical base64url encoding");
         }
-        if data.len() > MAX_TRANSFER_FILE_BYTES || data.len() as u64 != entry.size {
+        if data.len() as u64 != entry.size {
             bail!("network file payload has an invalid length");
         }
         let hash = hex::encode(Sha256::digest(&data));
         if hash != entry.sha256 {
             bail!("network file payload has an invalid hash");
-        }
-        total = total
-            .checked_add(data.len())
-            .ok_or_else(|| anyhow!("network transfer length overflow"))?;
-        if total > MAX_TRANSFER_TOTAL_BYTES {
-            bail!("network transfer is too large");
         }
     }
     Ok(())
@@ -781,6 +889,7 @@ fn make_transfer_request(
     remote: &Manifest,
 ) -> Result<(TransferRequest, usize)> {
     let mut download_paths = Vec::new();
+    let mut download_resumes = Vec::new();
     for (path, remote_entry) in &remote.entries {
         let remote_record = ManifestRecordRef::File(remote_entry);
         if matches!(select_record(local.record(path), Some(remote_record)), Some(selected) if selected.version() == remote_record.version() && selected.is_tombstone() == remote_record.is_tombstone())
@@ -790,12 +899,19 @@ fn make_transfer_request(
             });
             if !local_content_matches {
                 download_paths.push(path.clone());
+                download_resumes.push(TransferFile {
+                    path: path.clone(),
+                    sha256: remote_entry.sha256.clone(),
+                    size: remote_entry.size,
+                    offset: partial_size(share, path, &remote_entry.sha256, remote_entry.size)?,
+                });
             }
         }
     }
     download_paths.sort_unstable();
     download_paths.dedup();
     download_paths.truncate(MAX_TRANSFER_FILES);
+    download_resumes.retain(|file| download_paths.binary_search(&file.path).is_ok());
 
     let mut upload_paths = Vec::new();
     for (path, local_entry) in &local.entries {
@@ -812,20 +928,32 @@ fn make_transfer_request(
     upload_paths.sort_unstable();
     let requested_uploads = upload_paths.len();
     upload_paths.truncate(MAX_TRANSFER_FILES);
-    let files = build_file_payloads(share, local, &upload_paths)?;
-    let pending_updates = requested_uploads.saturating_sub(files.len());
+    let uploads = upload_paths
+        .iter()
+        .filter_map(|path| {
+            local.entries.get(path).map(|entry| TransferFile {
+                path: path.clone(),
+                sha256: entry.sha256.clone(),
+                size: entry.size,
+                offset: 0,
+            })
+        })
+        .collect::<Vec<_>>();
+    let pending_updates = requested_uploads.saturating_sub(uploads.len());
     Ok((
         TransferRequest {
             protocol_version: PROTOCOL_VERSION,
             share_id: share.share_id,
             manifest: local.clone(),
             download_paths,
-            files,
+            download_resumes,
+            uploads,
         },
         pending_updates,
     ))
 }
 
+#[allow(dead_code)]
 fn build_file_payloads(
     share: &Arc<ActiveShare>,
     manifest: &Manifest,
@@ -834,14 +962,10 @@ fn build_file_payloads(
     validate_path_list(paths)?;
     let root = config_root(&share.config()?)?;
     let mut files = Vec::new();
-    let mut total = 0_usize;
     for path in paths {
         let Some(entry) = manifest.entries.get(path) else {
             continue;
         };
-        if entry.size > MAX_TRANSFER_FILE_BYTES as u64 {
-            continue;
-        }
         let target = safe_local_path(&root, path, false)?;
         // Do not follow a leaf symlink. A stale manifest entry may otherwise cause a file outside
         // the shared directory to be uploaded after a local path was replaced with a symlink.
@@ -858,20 +982,11 @@ fn build_file_payloads(
             Ok(metadata) if metadata.file_type().is_file() => metadata,
             _ => continue,
         };
-        if after_read.len() != entry.size
-            || bytes.len() > MAX_TRANSFER_FILE_BYTES
-            || bytes.len() as u64 != entry.size
-        {
+        if after_read.len() != entry.size || bytes.len() as u64 != entry.size {
             continue;
         }
         if hex::encode(Sha256::digest(&bytes)) != entry.sha256 {
             continue;
-        }
-        total = total
-            .checked_add(bytes.len())
-            .ok_or_else(|| anyhow!("file transfer length overflow"))?;
-        if total > MAX_TRANSFER_TOTAL_BYTES {
-            break;
         }
         files.push(FilePayload {
             path: path.clone(),
@@ -882,8 +997,335 @@ fn build_file_payloads(
     Ok(files)
 }
 
-/// Applies only remote records whose file data is present. This avoids claiming a large or
-/// unstable file is synchronized before it was safely written to the shared directory.
+#[cfg(test)]
+fn chunk_ranges(total: u64, offset: u64, chunk_size: usize) -> Vec<(u64, usize)> {
+    let mut ranges = Vec::new();
+    let mut current = offset.min(total);
+    while current < total {
+        let length = usize::try_from((total - current).min(chunk_size as u64))
+            .expect("chunk length is bounded by the requested chunk size");
+        ranges.push((current, length));
+        current += length as u64;
+    }
+    ranges.push((current, 0));
+    ranges
+}
+
+fn partial_path(share: &Arc<ActiveShare>, manifest_path: &str, sha256: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(manifest_path.as_bytes());
+    hasher.update([0]);
+    hasher.update(sha256.as_bytes());
+    share
+        .paths
+        .share_tmp_dir(share.share_id)
+        .join(format!("chunk-{}.part", hex::encode(hasher.finalize())))
+}
+
+fn partial_size(
+    share: &Arc<ActiveShare>,
+    manifest_path: &str,
+    sha256: &str,
+    size: u64,
+) -> Result<u64> {
+    let path = partial_path(share, manifest_path, sha256);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() <= size => Ok(metadata.len()),
+        Ok(metadata) if metadata.is_file() => {
+            fs::remove_file(&path).with_context(|| {
+                format!(
+                    "unable to remove oversized transfer partial {}",
+                    path.display()
+                )
+            })?;
+            Ok(0)
+        }
+        Ok(_) => bail!("transfer partial path is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error)
+            .with_context(|| format!("unable to inspect transfer partial {}", path.display())),
+    }
+}
+
+fn make_transfer_ready(
+    share: &Arc<ActiveShare>,
+    request: &TransferRequest,
+) -> Result<TransferReady> {
+    validate_transfer_files(&request.uploads, &request.manifest)?;
+    let uploads = request
+        .uploads
+        .iter()
+        .map(|file| {
+            Ok(TransferFile {
+                path: file.path.clone(),
+                sha256: file.sha256.clone(),
+                size: file.size,
+                offset: partial_size(share, &file.path, &file.sha256, file.size)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(TransferReady {
+        protocol_version: PROTOCOL_VERSION,
+        share_id: request.share_id,
+        uploads,
+    })
+}
+
+fn build_transfer_files(
+    manifest: &Manifest,
+    paths: &[String],
+    resumes: &[TransferFile],
+) -> Result<Vec<TransferFile>> {
+    validate_path_list(paths)?;
+    validate_transfer_file_shapes(resumes)?;
+    let mut files = Vec::new();
+    for path in paths {
+        let Some(entry) = manifest.entries.get(path) else {
+            continue;
+        };
+        let offset = resumes
+            .iter()
+            .find(|resume| {
+                resume.path == *path && resume.sha256 == entry.sha256 && resume.size == entry.size
+            })
+            .map_or(0, |resume| resume.offset.min(entry.size));
+        files.push(TransferFile {
+            path: path.clone(),
+            sha256: entry.sha256.clone(),
+            size: entry.size,
+            offset,
+        });
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files.dedup_by(|left, right| left.path == right.path);
+    Ok(files)
+}
+
+async fn send_upload_chunks(
+    share: &Arc<ActiveShare>,
+    requested: &[TransferFile],
+    ready: &[TransferFile],
+    send: &mut SendStream,
+) -> Result<()> {
+    validate_transfer_file_shapes(requested)?;
+    validate_transfer_file_shapes(ready)?;
+    if requested.len() != ready.len() {
+        bail!("upload resume list has an unexpected length");
+    }
+    for (request, resume) in requested.iter().zip(ready) {
+        if request.path != resume.path
+            || request.sha256 != resume.sha256
+            || request.size != resume.size
+        {
+            bail!("upload resume metadata does not match the request");
+        }
+    }
+    send_file_chunks_from_root(share, ready, send).await
+}
+
+async fn send_file_chunks_from_root(
+    share: &Arc<ActiveShare>,
+    files: &[TransferFile],
+    send: &mut SendStream,
+) -> Result<()> {
+    let root = config_root(&share.config()?)?;
+    for file in files {
+        let target = safe_local_path(&root, &file.path, false)?;
+        let metadata = fs::symlink_metadata(&target)
+            .with_context(|| format!("unable to inspect shared file {}", target.display()))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != file.size {
+            bail!(
+                "shared file changed before chunk transfer: {}",
+                target.display()
+            );
+        }
+        let mut source = fs::File::open(&target)
+            .with_context(|| format!("unable to open shared file {}", target.display()))?;
+        source
+            .seek(SeekFrom::Start(file.offset))
+            .with_context(|| format!("unable to seek shared file {}", target.display()))?;
+        let mut offset = file.offset;
+        let mut buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
+        while offset < file.size {
+            let wanted = usize::try_from((file.size - offset).min(buffer.len() as u64))
+                .context("transfer chunk size does not fit this platform")?;
+            let count = source
+                .read(&mut buffer[..wanted])
+                .with_context(|| format!("unable to read shared file {}", target.display()))?;
+            if count == 0 {
+                bail!(
+                    "shared file ended during chunk transfer: {}",
+                    target.display()
+                );
+            }
+            write_json_frame(
+                send,
+                &ChunkFrame {
+                    path: file.path.clone(),
+                    sha256: file.sha256.clone(),
+                    offset,
+                    content: URL_SAFE_NO_PAD.encode(&buffer[..count]),
+                },
+            )
+            .await?;
+            offset += count as u64;
+        }
+        let after = fs::symlink_metadata(&target)
+            .with_context(|| format!("unable to inspect shared file {}", target.display()))?;
+        if !after.is_file() || after.len() != file.size {
+            bail!(
+                "shared file changed during chunk transfer: {}",
+                target.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_partial_file(path: &Path, offset: u64) -> Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("unable to create transfer state {}", parent.display()))?;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() == offset => {}
+        Ok(metadata) if metadata.is_file() => {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .with_context(|| format!("unable to open transfer partial {}", path.display()))?;
+            file.set_len(offset)
+                .with_context(|| format!("unable to resize transfer partial {}", path.display()))?;
+        }
+        Ok(_) => bail!("transfer partial path is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let file = fs::File::create(path)
+                .with_context(|| format!("unable to create transfer partial {}", path.display()))?;
+            file.set_len(offset)
+                .with_context(|| format!("unable to resize transfer partial {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("unable to inspect transfer partial {}", path.display()));
+        }
+    }
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("unable to open transfer partial {}", path.display()))
+}
+
+fn verify_partial(path: &Path, file: &TransferFile) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("unable to inspect transfer partial {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() != file.size {
+        bail!("transfer partial has an invalid size");
+    }
+    let mut source = fs::File::open(path)
+        .with_context(|| format!("unable to open transfer partial {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = source
+            .read(&mut buffer)
+            .with_context(|| format!("unable to read transfer partial {}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    if hex::encode(hasher.finalize()) != file.sha256 {
+        bail!("transfer partial hash does not match its manifest");
+    }
+    Ok(())
+}
+
+async fn receive_file_chunks(
+    share: &Arc<ActiveShare>,
+    files: &[TransferFile],
+    recv: &mut RecvStream,
+) -> Result<Vec<CompletedFile>> {
+    validate_transfer_file_shapes(files)?;
+    let mut completed = Vec::new();
+    for file in files {
+        let partial = partial_path(share, &file.path, &file.sha256);
+        let mut destination = ensure_partial_file(&partial, file.offset)?;
+        destination
+            .seek(SeekFrom::Start(file.offset))
+            .with_context(|| format!("unable to seek transfer partial {}", partial.display()))?;
+        let mut offset = file.offset;
+        while offset < file.size {
+            let frame: ChunkFrame = read_json_frame(recv).await?;
+            if frame.path != file.path || frame.sha256 != file.sha256 || frame.offset != offset {
+                bail!("chunk frame does not match the requested transfer");
+            }
+            let data = URL_SAFE_NO_PAD
+                .decode(&frame.content)
+                .map_err(|_| anyhow!("chunk frame payload is not valid base64url"))?;
+            if URL_SAFE_NO_PAD.encode(&data) != frame.content
+                || data.is_empty()
+                || data.len() > TRANSFER_CHUNK_BYTES
+                || offset.saturating_add(data.len() as u64) > file.size
+            {
+                bail!("chunk frame has an invalid payload length");
+            }
+            destination.write_all(&data).with_context(|| {
+                format!("unable to write transfer partial {}", partial.display())
+            })?;
+            offset += data.len() as u64;
+        }
+        destination
+            .sync_all()
+            .with_context(|| format!("unable to flush transfer partial {}", partial.display()))?;
+        verify_partial(&partial, file)?;
+        completed.push(CompletedFile {
+            file: file.clone(),
+            staged_path: partial,
+        });
+    }
+    Ok(completed)
+}
+
+async fn receive_download_chunks(
+    share: &Arc<ActiveShare>,
+    files: &[TransferFile],
+    recv: &mut RecvStream,
+) -> Result<Vec<CompletedFile>> {
+    receive_file_chunks(share, files, recv).await
+}
+
+async fn receive_upload_chunks(
+    share: &Arc<ActiveShare>,
+    share_id: ShareId,
+    requested: &[TransferFile],
+    ready: &[TransferFile],
+    recv: &mut RecvStream,
+) -> Result<Vec<CompletedFile>> {
+    validate_transfer_ready(
+        &TransferReady {
+            protocol_version: PROTOCOL_VERSION,
+            share_id,
+            uploads: ready.to_vec(),
+        },
+        share_id,
+        requested,
+    )?;
+    receive_file_chunks(share, ready, recv).await
+}
+
+#[allow(dead_code)]
+enum IncomingFile {
+    Bytes(Vec<u8>),
+    Staged(PathBuf),
+}
+
+struct CompletedFile {
+    file: TransferFile,
+    staged_path: PathBuf,
+}
+
+#[allow(dead_code)]
 fn apply_remote_transfer(
     share: &Arc<ActiveShare>,
     remote: &Manifest,
@@ -891,16 +1333,51 @@ fn apply_remote_transfer(
 ) -> Result<ApplyOutcome> {
     remote.validate(share.share_id)?;
     validate_file_payloads(files, remote)?;
-    let config = share.config()?;
-    let root = config_root(&config)?;
-    let local = share.paths.load_manifest(share.share_id)?;
     let mut file_data = BTreeMap::new();
     for file in files {
         let bytes = URL_SAFE_NO_PAD
             .decode(&file.content)
             .map_err(|_| anyhow!("network file payload is not valid base64url"))?;
-        file_data.insert(file.path.clone(), bytes);
+        file_data.insert(file.path.clone(), IncomingFile::Bytes(bytes));
     }
+    apply_remote_transfer_impl(share, remote, &file_data)
+}
+
+fn apply_remote_staged_transfer(
+    share: &Arc<ActiveShare>,
+    remote: &Manifest,
+    files: &[CompletedFile],
+) -> Result<ApplyOutcome> {
+    remote.validate(share.share_id)?;
+    let descriptors = files
+        .iter()
+        .map(|file| file.file.clone())
+        .collect::<Vec<_>>();
+    validate_transfer_files(&descriptors, remote)?;
+    let mut file_data = BTreeMap::new();
+    for file in files {
+        file_data.insert(
+            file.file.path.clone(),
+            IncomingFile::Staged(file.staged_path.clone()),
+        );
+    }
+    let result = apply_remote_transfer_impl(share, remote, &file_data);
+    if result.is_ok() {
+        for file in files {
+            let _ = fs::remove_file(&file.staged_path);
+        }
+    }
+    result
+}
+
+fn apply_remote_transfer_impl(
+    share: &Arc<ActiveShare>,
+    remote: &Manifest,
+    file_data: &BTreeMap<String, IncomingFile>,
+) -> Result<ApplyOutcome> {
+    let config = share.config()?;
+    let root = config_root(&config)?;
+    let local = share.paths.load_manifest(share.share_id)?;
 
     let mut candidate = local.clone();
     let mut pending_downloads = 0_usize;
@@ -926,6 +1403,7 @@ fn apply_remote_transfer(
             remove_local_path(&root, path)?;
             candidate.entries.remove(path);
             candidate.directories.remove(path);
+            candidate.symlinks.remove(path);
             candidate.tombstones.insert(path.clone(), tombstone.clone());
             applied_records = applied_records.saturating_add(1);
         }
@@ -942,6 +1420,7 @@ fn apply_remote_transfer(
         if let Some(ManifestRecordRef::Directory(entry)) = remote_record {
             ensure_local_directory(&root, path)?;
             candidate.entries.remove(path);
+            candidate.symlinks.remove(path);
             candidate.tombstones.remove(path);
             candidate.directories.insert(path.clone(), entry.clone());
             directory_permissions.push((path.clone(), entry.permissions));
@@ -955,12 +1434,36 @@ fn apply_remote_transfer(
         if !remote_record_wins(local_record, remote_record) {
             continue;
         }
+        if let Some(ManifestRecordRef::Symlink(entry)) = remote_record {
+            write_local_symlink(share, &root, path, &entry.target)?;
+            candidate.entries.remove(path);
+            candidate.directories.remove(path);
+            candidate.tombstones.remove(path);
+            candidate.symlinks.insert(path.clone(), entry.clone());
+            applied_records = applied_records.saturating_add(1);
+        }
+    }
+
+    for path in &all_paths {
+        let local_record = local.record(path);
+        let remote_record = remote.record(path);
+        if !remote_record_wins(local_record, remote_record) {
+            continue;
+        }
         if let Some(ManifestRecordRef::File(entry)) = remote_record {
-            if let Some(bytes) = file_data.get(path) {
-                write_local_file(share, &root, path, bytes, entry.permissions)?;
+            if let Some(incoming) = file_data.get(path) {
+                match incoming {
+                    IncomingFile::Bytes(bytes) => {
+                        write_local_file(share, &root, path, bytes, entry.permissions)?;
+                    }
+                    IncomingFile::Staged(staged_path) => {
+                        write_local_staged_file(&root, path, staged_path, entry.permissions)?;
+                    }
+                }
                 candidate.directories.remove(path);
                 candidate.entries.remove(path);
                 candidate.tombstones.remove(path);
+                candidate.symlinks.remove(path);
                 candidate.entries.insert(path.clone(), entry.clone());
                 applied_records = applied_records.saturating_add(1);
             } else {
@@ -999,6 +1502,7 @@ fn apply_remote_transfer(
     candidate.validate(share.share_id)?;
     if candidate.entries != local.entries
         || candidate.directories != local.directories
+        || candidate.symlinks != local.symlinks
         || candidate.tombstones != local.tombstones
     {
         observe_manifest_clock(share, &candidate)?;
@@ -1155,9 +1659,10 @@ fn ensure_local_directory(root: &Path, manifest_path: &str) -> Result<()> {
     with_writable_parents(root, manifest_path, true, || {
         let target = safe_local_path(root, manifest_path, true)?;
         match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                bail!("refusing to replace symbolic link {}", target.display())
-            }
+            Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(&target)
+                .with_context(|| {
+                    format!("unable to replace shared symlink {}", target.display())
+                })?,
             Ok(metadata) if metadata.is_dir() => return Ok(()),
             // A newer remote directory record may replace a local file at the same path. Do not
             // follow a symbolic link or replace another special file type.
@@ -1202,7 +1707,7 @@ fn local_file_matches_entry(
             let mut file = fs::File::open(&target)
                 .with_context(|| format!("unable to read shared file {}", target.display()))?;
             let mut hasher = Sha256::new();
-            let mut buffer = [0_u8; 64 * 1024];
+            let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
             loop {
                 let count = file
                     .read(&mut buffer)
@@ -1233,9 +1738,10 @@ fn write_local_file(
     with_writable_parents(root, manifest_path, true, || {
         let target = safe_local_path(root, manifest_path, true)?;
         match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                bail!("refusing to replace symbolic link {}", target.display());
-            }
+            Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(&target)
+                .with_context(|| {
+                    format!("unable to replace shared symlink {}", target.display())
+                })?,
             // Descendant tombstones are applied before files, so a newer remote file can replace
             // an emptied local directory without discarding untracked content.
             Ok(metadata) if metadata.is_dir() => fs::remove_dir(&target).with_context(|| {
@@ -1294,15 +1800,136 @@ fn write_local_file(
     })
 }
 
+fn write_local_staged_file(
+    root: &Path,
+    manifest_path: &str,
+    staged_path: &Path,
+    permissions: Option<u16>,
+) -> Result<()> {
+    with_writable_parents(root, manifest_path, true, || {
+        let target = safe_local_path(root, manifest_path, true)?;
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir(&target).with_context(|| {
+                format!("unable to replace shared directory {}", target.display())
+            })?,
+            Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(&target)
+                .with_context(|| {
+                    format!("unable to replace shared symlink {}", target.display())
+                })?,
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => bail!("refusing to replace non-file {}", target.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("unable to inspect shared path {}", target.display())
+                });
+            }
+        }
+        let staged_metadata = fs::symlink_metadata(staged_path)
+            .with_context(|| format!("unable to inspect staged file {}", staged_path.display()))?;
+        if !staged_metadata.is_file() || staged_metadata.file_type().is_symlink() {
+            bail!("staged transfer is not a regular file");
+        }
+        match fs::rename(staged_path, &target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+                fs::copy(staged_path, &target).with_context(|| {
+                    format!("unable to install staged file {}", target.display())
+                })?;
+                fs::remove_file(staged_path).with_context(|| {
+                    format!("unable to remove staged file {}", staged_path.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("unable to install staged file {}", target.display())
+                });
+            }
+        }
+        set_local_file_permissions(root, manifest_path, permissions)
+    })
+}
+
+fn write_local_symlink(
+    share: &Arc<ActiveShare>,
+    root: &Path,
+    manifest_path: &str,
+    target: &str,
+) -> Result<()> {
+    validate_manifest_path(manifest_path)?;
+    if target.is_empty() || target.len() > 4096 || target.contains('\0') {
+        bail!("remote symlink target is invalid");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        with_writable_parents(root, manifest_path, true, || {
+            let local_target = safe_local_path(root, manifest_path, true)?;
+            match fs::symlink_metadata(&local_target) {
+                Ok(metadata) if metadata.is_dir() => {
+                    fs::remove_dir(&local_target).with_context(|| {
+                        format!(
+                            "unable to replace shared directory {}",
+                            local_target.display()
+                        )
+                    })?;
+                }
+                Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                    fs::remove_file(&local_target).with_context(|| {
+                        format!("unable to replace shared path {}", local_target.display())
+                    })?;
+                }
+                Ok(_) => bail!("refusing to replace non-file {}", local_target.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("unable to inspect shared path {}", local_target.display())
+                    });
+                }
+            }
+            let temporary = share.paths.share_tmp_dir(share.share_id).join(format!(
+                "symlink-{}-{}.tmp",
+                std::process::id(),
+                rand::rng().random::<u64>()
+            ));
+            let result = (|| -> Result<()> {
+                symlink(target, &temporary)
+                    .with_context(|| format!("unable to stage symlink target {target}"))?;
+                match fs::rename(&temporary, &local_target) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+                        let _ = fs::remove_file(&temporary);
+                        symlink(target, &local_target).with_context(|| {
+                            format!("unable to install symlink {}", local_target.display())
+                        })
+                    }
+                    Err(error) => Err(error).with_context(|| {
+                        format!("unable to install symlink {}", local_target.display())
+                    }),
+                }
+            })();
+            if result.is_err() {
+                let _ = fs::remove_file(&temporary);
+            }
+            result
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (share, root, manifest_path, target);
+        bail!("symbolic links are not supported on this platform")
+    }
+}
+
 fn remove_local_path(root: &Path, manifest_path: &str) -> Result<()> {
     with_writable_parents(root, manifest_path, false, || {
         let target = safe_local_path(root, manifest_path, false)?;
         match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                bail!("refusing to delete symbolic link {}", target.display())
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                fs::remove_file(&target)
+                    .with_context(|| format!("unable to remove shared path {}", target.display()))
             }
-            Ok(metadata) if metadata.is_file() => fs::remove_file(&target)
-                .with_context(|| format!("unable to remove shared file {}", target.display())),
             Ok(metadata) if metadata.is_dir() => fs::remove_dir(&target).with_context(|| {
                 format!(
                     "unable to remove empty shared directory {}",
@@ -1402,8 +2029,7 @@ fn with_writable_parents<T>(
     let result = operation();
     let restore_result = restore_parent_permissions(restores);
     match (result, restore_result) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         (Ok(value), Ok(())) => Ok(value),
     }
 }
@@ -1512,19 +2138,21 @@ fn with_readable_file<T>(target: &Path, operation: impl FnOnce() -> Result<T>) -
         None
     };
     let result = operation();
-    let restore_result = if let Some(permissions) = restore_permissions {
-        fs::set_permissions(target, fs::Permissions::from_mode(permissions)).with_context(|| {
-            format!(
-                "unable to restore permissions on shared file {}",
-                target.display()
+    let restore_result = restore_permissions.map_or_else(
+        || Ok(()),
+        |permissions| {
+            fs::set_permissions(target, fs::Permissions::from_mode(permissions)).with_context(
+                || {
+                    format!(
+                        "unable to restore permissions on shared file {}",
+                        target.display()
+                    )
+                },
             )
-        })
-    } else {
-        Ok(())
-    };
+        },
+    );
     match (result, restore_result) {
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         (Ok(value), Ok(())) => Ok(value),
     }
 }
@@ -1940,7 +2568,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        manifest::{DirectoryEntry, MANIFEST_FORMAT_VERSION, ManifestEntry, Tombstone},
+        manifest::{
+            DirectoryEntry, MANIFEST_FORMAT_VERSION, ManifestEntry, SymlinkEntry, Tombstone,
+        },
         types::{ClockState, FORMAT_VERSION, HlcTimestamp, KnownPeers, RuntimeStatus, ShareSecret},
     };
 
@@ -1972,7 +2602,40 @@ mod tests {
         assert_ne!(proof, client_proof(&other, &client, &server, [7; 32]));
     }
 
+    #[test]
+    fn chunk_ranges_resume_from_existing_offset() {
+        assert_eq!(chunk_ranges(10, 4, 3), vec![(4, 3), (7, 3), (10, 0)]);
+    }
+
     #[cfg(unix)]
+    #[test]
+    fn transfer_descriptors_accept_files_larger_than_sixteen_mib() {
+        let bytes = vec![7_u8; 17 * 1024 * 1024];
+        let share_id = ShareId([23; 32]);
+        let endpoint = SecretKey::from_bytes(&[24; 32]).public();
+        let manifest = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 1,
+            entries: BTreeMap::from([(
+                "large.bin".to_owned(),
+                file_entry(&bytes, 0o640, timestamp(1, endpoint)),
+            )]),
+            directories: BTreeMap::new(),
+            symlinks: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
+        };
+        let file = TransferFile {
+            path: "large.bin".to_owned(),
+            sha256: manifest.entries["large.bin"].sha256.clone(),
+            size: bytes.len() as u64,
+            offset: 0,
+        };
+        validate_transfer_files(&[file], &manifest).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::needless_pass_by_value)]
     fn active_share(root: &Path, manifest: Manifest, endpoint: EndpointId) -> Arc<ActiveShare> {
         let paths = DataPaths::from_root(root.parent().unwrap().join("state"));
         let config = ShareConfig {
@@ -2066,6 +2729,7 @@ mod tests {
                     directory_entry(0o750, timestamp(1, remote_endpoint)),
                 ),
             ]),
+            symlinks: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         };
         let files = vec![FilePayload {
@@ -2112,6 +2776,7 @@ mod tests {
                 "private".to_owned(),
                 directory_entry(0o755, timestamp(1, local_endpoint)),
             )]),
+            symlinks: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         };
         let share = active_share(&root, local.clone(), local_endpoint);
@@ -2127,12 +2792,13 @@ mod tests {
                 "private".to_owned(),
                 directory_entry(0o700, timestamp(2, remote_endpoint)),
             )]),
+            symlinks: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         };
         let (transfer, pending_updates) = make_transfer_request(&share, &local, &remote).unwrap();
         assert_eq!(pending_updates, 0);
-        assert!(transfer.download_paths.is_empty());
-        assert!(transfer.files.is_empty());
+        assert_eq!(transfer.download_paths, Vec::<String>::new());
+        assert!(transfer.uploads.is_empty());
 
         let outcome = apply_remote_transfer(&share, &remote, &[]).unwrap();
         assert_eq!(outcome.pending_downloads, 0);
@@ -2142,6 +2808,44 @@ mod tests {
         let stored = share.paths.load_manifest(share_id).unwrap();
         assert_eq!(stored.entries, remote.entries);
         assert_eq!(stored.directories, remote.directories);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_transfer_applies_symlink_target_without_following_it() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+        let share_id = ShareId([20; 32]);
+        let local_endpoint = SecretKey::from_bytes(&[21; 32]).public();
+        let remote_endpoint = SecretKey::from_bytes(&[22; 32]).public();
+        let share = active_share(&root, Manifest::empty(share_id, 0), local_endpoint);
+        let remote = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 2,
+            entries: BTreeMap::new(),
+            directories: BTreeMap::new(),
+            symlinks: BTreeMap::from([(
+                "alias.txt".to_owned(),
+                SymlinkEntry {
+                    target: "target.txt".to_owned(),
+                    version: timestamp(2, remote_endpoint),
+                },
+            )]),
+            tombstones: BTreeMap::new(),
+        };
+
+        let outcome = apply_remote_transfer(&share, &remote, &[]).unwrap();
+        assert_eq!(outcome.pending_downloads, 0);
+        assert_eq!(
+            fs::read_link(root.join("alias.txt")).unwrap(),
+            Path::new("target.txt")
+        );
+        assert_eq!(
+            share.paths.load_manifest(share_id).unwrap().symlinks,
+            remote.symlinks
+        );
     }
 
     #[cfg(unix)]
@@ -2173,6 +2877,7 @@ mod tests {
                 "private".to_owned(),
                 directory_entry(0o555, directory_version),
             )]),
+            symlinks: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         };
         let share = active_share(&root, local, local_endpoint);
@@ -2188,6 +2893,7 @@ mod tests {
                 "private".to_owned(),
                 directory_entry(0o555, directory_version),
             )]),
+            symlinks: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         };
         let files = vec![FilePayload {
@@ -2223,6 +2929,7 @@ mod tests {
                 file_entry(b"old file", 0o600, timestamp(1, local_endpoint)),
             )]),
             directories: BTreeMap::new(),
+            symlinks: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         };
         let share = active_share(&root, local, local_endpoint);
@@ -2239,6 +2946,7 @@ mod tests {
                 "entry".to_owned(),
                 directory_entry(0o750, timestamp(2, remote_endpoint)),
             )]),
+            symlinks: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         };
         let files = vec![FilePayload {
@@ -2283,6 +2991,7 @@ mod tests {
                 "entry".to_owned(),
                 directory_entry(0o700, timestamp(1, local_endpoint)),
             )]),
+            symlinks: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         };
         let share = active_share(&root, local, local_endpoint);
@@ -2296,6 +3005,7 @@ mod tests {
                 file_entry(bytes, 0o640, timestamp(3, remote_endpoint)),
             )]),
             directories: BTreeMap::new(),
+            symlinks: BTreeMap::new(),
             tombstones: BTreeMap::from([(
                 "entry/old.txt".to_owned(),
                 Tombstone {

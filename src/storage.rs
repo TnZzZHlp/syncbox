@@ -627,6 +627,9 @@ mod tests {
         let paths = DataPaths::from_root(temporary.path().join("data"));
         paths.ensure_layout().unwrap();
         fs::create_dir(paths.shares_dir().join("not-a-share")).unwrap();
-        assert!(paths.list_share_ids().unwrap().is_empty());
+        assert_eq!(
+            paths.list_share_ids().unwrap(),
+            Vec::<crate::types::ShareId>::new()
+        );
     }
 }

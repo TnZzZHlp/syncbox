@@ -15,7 +15,8 @@ use walkdir::WalkDir;
 use crate::types::{ClockState, HlcTimestamp, ShareId};
 
 pub const MAX_MANIFEST_ENTRIES: usize = 100_000;
-pub const MANIFEST_FORMAT_VERSION: u16 = 2;
+pub const MANIFEST_FORMAT_VERSION: u16 = 3;
+const PREVIOUS_MANIFEST_FORMAT_VERSION: u16 = 2;
 const LEGACY_MANIFEST_FORMAT_VERSION: u16 = 1;
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -28,6 +29,8 @@ pub struct Manifest {
     pub entries: BTreeMap<String, ManifestEntry>,
     #[serde(default)]
     pub directories: BTreeMap<String, DirectoryEntry>,
+    #[serde(default)]
+    pub symlinks: BTreeMap<String, SymlinkEntry>,
     pub tombstones: BTreeMap<String, Tombstone>,
 }
 
@@ -39,6 +42,7 @@ impl Manifest {
             scanned_at_ms: now_ms,
             entries: BTreeMap::new(),
             directories: BTreeMap::new(),
+            symlinks: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         }
     }
@@ -46,7 +50,9 @@ impl Manifest {
     pub fn validate(&self, expected_share_id: ShareId) -> Result<()> {
         if !matches!(
             self.format_version,
-            LEGACY_MANIFEST_FORMAT_VERSION | MANIFEST_FORMAT_VERSION
+            LEGACY_MANIFEST_FORMAT_VERSION
+                | PREVIOUS_MANIFEST_FORMAT_VERSION
+                | MANIFEST_FORMAT_VERSION
         ) {
             bail!(
                 "unsupported manifest format version {}",
@@ -60,6 +66,7 @@ impl Manifest {
             .entries
             .len()
             .checked_add(self.directories.len())
+            .and_then(|total| total.checked_add(self.symlinks.len()))
             .and_then(|total| total.checked_add(self.tombstones.len()))
             .ok_or_else(|| anyhow!("manifest entry count overflow"))?;
         if total > MAX_MANIFEST_ENTRIES {
@@ -82,6 +89,16 @@ impl Manifest {
                 bail!("manifest has both an entry and a tombstone for {path}");
             }
         }
+        for (path, entry) in &self.symlinks {
+            validate_manifest_path(path)?;
+            entry.validate()?;
+            if self.entries.contains_key(path) || self.directories.contains_key(path) {
+                bail!("manifest has both a live path and a symlink for {path}");
+            }
+            if self.tombstones.contains_key(path) {
+                bail!("manifest has both an entry and a tombstone for {path}");
+            }
+        }
         for (path, tombstone) in &self.tombstones {
             validate_manifest_path(path)?;
             tombstone.validate()?;
@@ -97,6 +114,9 @@ impl Manifest {
         if let Some(entry) = self.directories.get(path) {
             return Some(ManifestRecordRef::Directory(entry));
         }
+        if let Some(entry) = self.symlinks.get(path) {
+            return Some(ManifestRecordRef::Symlink(entry));
+        }
         self.tombstones.get(path).map(ManifestRecordRef::Tombstone)
     }
 
@@ -104,6 +124,7 @@ impl Manifest {
         self.entries
             .keys()
             .chain(self.directories.keys())
+            .chain(self.symlinks.keys())
             .chain(self.tombstones.keys())
             .cloned()
             .collect()
@@ -149,6 +170,27 @@ impl DirectoryEntry {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SymlinkEntry {
+    pub target: String,
+    pub version: HlcTimestamp,
+}
+
+impl SymlinkEntry {
+    pub fn validate(&self) -> Result<()> {
+        validate_symlink_target(&self.target)?;
+        validate_timestamp(&self.version)
+    }
+}
+
+fn validate_symlink_target(target: &str) -> Result<()> {
+    if target.is_empty() || target.len() > 4096 || target.contains('\0') {
+        bail!("manifest symlink target is invalid");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tombstone {
@@ -178,6 +220,7 @@ fn validate_permissions(permissions: Option<u16>) -> Result<()> {
 pub enum ManifestRecordRef<'a> {
     File(&'a ManifestEntry),
     Directory(&'a DirectoryEntry),
+    Symlink(&'a SymlinkEntry),
     Tombstone(&'a Tombstone),
 }
 
@@ -186,6 +229,7 @@ impl ManifestRecordRef<'_> {
         match self {
             Self::File(entry) => entry.version,
             Self::Directory(entry) => entry.version,
+            Self::Symlink(entry) => entry.version,
             Self::Tombstone(tombstone) => tombstone.version,
         }
     }
@@ -199,6 +243,7 @@ impl ManifestRecordRef<'_> {
 pub enum ManifestRecord {
     File(ManifestEntry),
     Directory(DirectoryEntry),
+    Symlink(SymlinkEntry),
     Tombstone(Tombstone),
 }
 
@@ -207,6 +252,7 @@ impl ManifestRecord {
         match self {
             Self::File(entry) => entry.version,
             Self::Directory(entry) => entry.version,
+            Self::Symlink(entry) => entry.version,
             Self::Tombstone(tombstone) => tombstone.version,
         }
     }
@@ -235,6 +281,7 @@ pub fn scan_manifest(
     let discovered = discover_entries(root)?;
     let mut entries = BTreeMap::new();
     let mut directories = BTreeMap::new();
+    let mut symlinks = BTreeMap::new();
     let mut tombstones = previous.tombstones.clone();
     let mut changes = 0_usize;
 
@@ -286,8 +333,32 @@ pub fn scan_manifest(
         directories.insert(path.clone(), entry);
     }
 
-    for path in previous.entries.keys().chain(previous.directories.keys()) {
-        if !discovered.files.contains_key(path) && !discovered.directories.contains_key(path) {
+    for (path, discovered_symlink) in &discovered.symlinks {
+        let old_entry = previous.symlinks.get(path);
+        let unchanged = old_entry.is_some_and(|entry| entry.target == discovered_symlink.target);
+        let entry = if let Some(old_entry) = old_entry.filter(|_| unchanged) {
+            old_entry.clone()
+        } else {
+            changes = changes.saturating_add(1);
+            SymlinkEntry {
+                target: discovered_symlink.target.clone(),
+                version: clock.tick(now_ms, *endpoint_id.as_bytes())?,
+            }
+        };
+        let _ = tombstones.remove(path);
+        symlinks.insert(path.clone(), entry);
+    }
+
+    for path in previous
+        .entries
+        .keys()
+        .chain(previous.directories.keys())
+        .chain(previous.symlinks.keys())
+    {
+        if !discovered.files.contains_key(path)
+            && !discovered.directories.contains_key(path)
+            && !discovered.symlinks.contains_key(path)
+        {
             changes = changes.saturating_add(1);
             tombstones.insert(
                 path.clone(),
@@ -304,6 +375,7 @@ pub fn scan_manifest(
         scanned_at_ms: now_ms,
         entries,
         directories,
+        symlinks,
         tombstones,
     };
     manifest.validate(previous.share_id)?;
@@ -329,9 +401,14 @@ struct DiscoveredDirectory {
     permissions: Option<u16>,
 }
 
+struct DiscoveredSymlink {
+    target: String,
+}
+
 struct DiscoveredEntries {
     files: BTreeMap<String, DiscoveredFile>,
     directories: BTreeMap<String, DiscoveredDirectory>,
+    symlinks: BTreeMap<String, DiscoveredSymlink>,
 }
 
 fn discover_entries(root: &Path) -> Result<DiscoveredEntries> {
@@ -343,6 +420,7 @@ fn discover_entries(root: &Path) -> Result<DiscoveredEntries> {
 
     let mut files = BTreeMap::new();
     let mut directories = BTreeMap::new();
+    let mut symlinks = BTreeMap::new();
     for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
         let entry =
             entry.with_context(|| format!("unable to scan local directory {}", root.display()))?;
@@ -350,20 +428,29 @@ fn discover_entries(root: &Path) -> Result<DiscoveredEntries> {
             continue;
         }
         let file_type = entry.file_type();
-        if file_type.is_symlink() {
-            continue;
-        }
-        if !file_type.is_dir() && !file_type.is_file() {
+        if !file_type.is_dir() && !file_type.is_file() && !file_type.is_symlink() {
             continue;
         }
         if files
             .len()
             .checked_add(directories.len())
+            .and_then(|count| count.checked_add(symlinks.len()))
             .is_none_or(|count| count >= MAX_MANIFEST_ENTRIES)
         {
             bail!("local directory exceeds the maximum supported file count");
         }
         let path = relative_manifest_path(root, entry.path())?;
+        if file_type.is_symlink() {
+            let target = fs::read_link(entry.path())
+                .with_context(|| format!("unable to read symlink {}", entry.path().display()))?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| anyhow!("local symlink target is not valid UTF-8"))?
+                .to_owned();
+            validate_symlink_target(&target)?;
+            symlinks.insert(path, DiscoveredSymlink { target });
+            continue;
+        }
         let metadata = entry
             .metadata()
             .with_context(|| format!("unable to inspect local path {}", entry.path().display()))?;
@@ -388,7 +475,11 @@ fn discover_entries(root: &Path) -> Result<DiscoveredEntries> {
             );
         }
     }
-    Ok(DiscoveredEntries { files, directories })
+    Ok(DiscoveredEntries {
+        files,
+        directories,
+        symlinks,
+    })
 }
 
 fn hash_stable_file(
@@ -434,6 +525,7 @@ fn hash_stable_file(
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
 fn permissions_from_metadata(metadata: &fs::Metadata) -> Option<u16> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -456,7 +548,7 @@ fn permissions_match(_left: Option<u16>, _right: Option<u16>) -> bool {
 }
 
 #[cfg(unix)]
-fn selected_permissions(_previous: Option<u16>, discovered: Option<u16>) -> Option<u16> {
+const fn selected_permissions(_previous: Option<u16>, discovered: Option<u16>) -> Option<u16> {
     discovered
 }
 
@@ -560,6 +652,9 @@ pub fn merge_manifests(local: &Manifest, remote: &Manifest, now_ms: u64) -> Resu
             Some(ManifestRecordRef::Directory(entry)) => {
                 merged.directories.insert(path.clone(), entry.clone());
             }
+            Some(ManifestRecordRef::Symlink(entry)) => {
+                merged.symlinks.insert(path.clone(), entry.clone());
+            }
             Some(ManifestRecordRef::Tombstone(tombstone)) => {
                 merged.tombstones.insert(path.clone(), tombstone.clone());
             }
@@ -571,7 +666,12 @@ pub fn merge_manifests(local: &Manifest, remote: &Manifest, now_ms: u64) -> Resu
 }
 
 fn validate_manifest_hierarchy(manifest: &Manifest) -> Result<()> {
-    for path in manifest.entries.keys().chain(manifest.directories.keys()) {
+    for path in manifest
+        .entries
+        .keys()
+        .chain(manifest.directories.keys())
+        .chain(manifest.symlinks.keys())
+    {
         let mut ancestor = String::new();
         let mut components = path.split('/').peekable();
         while let Some(component) = components.next() {
@@ -582,8 +682,9 @@ fn validate_manifest_hierarchy(manifest: &Manifest) -> Result<()> {
                 ancestor.push('/');
             }
             ancestor.push_str(component);
-            if manifest.entries.contains_key(&ancestor) {
-                bail!("manifest file has a descendant: {ancestor}");
+            if manifest.entries.contains_key(&ancestor) || manifest.symlinks.contains_key(&ancestor)
+            {
+                bail!("manifest live path has a descendant: {ancestor}");
             }
             if manifest.tombstones.contains_key(&ancestor) {
                 bail!("manifest has a live path below a tombstone: {ancestor}");
@@ -646,6 +747,26 @@ mod tests {
         for path in ["", "../secret", "/secret", "a\\b", "a/../../b"] {
             assert!(validate_manifest_path(path).is_err(), "{path}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_tracks_symlink_targets_without_following_them() {
+        let temporary = TempDir::new().unwrap();
+        fs::write(temporary.path().join("target.txt"), "target").unwrap();
+        std::os::unix::fs::symlink("target.txt", temporary.path().join("alias.txt")).unwrap();
+        let share_id = ShareId([8; 32]);
+        let endpoint = SecretKey::from_bytes(&[9; 32]).public();
+        let scanned = scan_manifest(
+            temporary.path(),
+            &Manifest::empty(share_id, 1),
+            ClockState::new(),
+            &endpoint,
+            2,
+        )
+        .unwrap();
+        assert_eq!(scanned.manifest.symlinks["alias.txt"].target, "target.txt");
+        assert!(!scanned.manifest.entries.contains_key("alias.txt"));
     }
 
     #[cfg(unix)]
