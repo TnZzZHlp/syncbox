@@ -278,7 +278,7 @@ pub fn scan_manifest(
 ) -> Result<ScanResult> {
     previous.validate(previous.share_id)?;
     clock.validate()?;
-    let discovered = discover_entries(root)?;
+    let discovered = discover_entries(root, previous)?;
     let mut entries = BTreeMap::new();
     let mut directories = BTreeMap::new();
     let mut symlinks = BTreeMap::new();
@@ -293,7 +293,15 @@ pub fn scan_manifest(
                 && permissions_match(entry.permissions, discovered_file.permissions)
         });
         let entry = if let Some(old_entry) = old_entry.filter(|_| unchanged) {
-            old_entry.clone()
+            // Keep the stored digest/permissions/version, but refresh the recorded
+            // mtime to the current on-disk value. Files applied from a remote peer
+            // carry the producer's timestamp in the merged manifest, which never
+            // equals the local disk mtime; converging it here lets the scan fast
+            // path match on the very next cycle instead of re-hashing forever.
+            ManifestEntry {
+                modified_at_ns: discovered_file.modified_at_ns,
+                ..old_entry.clone()
+            }
         } else {
             changes = changes.saturating_add(1);
             let version = clock.tick(now_ms, *endpoint_id.as_bytes())?;
@@ -411,7 +419,7 @@ struct DiscoveredEntries {
     symlinks: BTreeMap<String, DiscoveredSymlink>,
 }
 
-fn discover_entries(root: &Path) -> Result<DiscoveredEntries> {
+fn discover_entries(root: &Path, previous: &Manifest) -> Result<DiscoveredEntries> {
     let metadata = fs::metadata(root)
         .with_context(|| format!("unable to inspect local directory {}", root.display()))?;
     if !metadata.is_dir() {
@@ -462,8 +470,30 @@ fn discover_entries(root: &Path) -> Result<DiscoveredEntries> {
                 },
             );
         } else {
-            let (size, modified_at_ns, sha256, permissions) =
-                hash_stable_file(entry.path(), &metadata)?;
+            // Fast path: if the previous manifest holds an entry whose size, mtime and
+            // permissions all still match what stat reports, reuse its stored digest
+            // instead of re-reading and re-hashing the whole file. Content changes are
+            // always reflected in mtime/size (or permissions), so skipping the digest
+            // recomputation is safe and turns repeated full-directory scans into
+            // stat-only walks.
+            let (size, modified_at_ns, sha256, permissions) = match previous.entries.get(&path) {
+                Some(old)
+                    if old.size == metadata.len()
+                        && modified_at_ns(&metadata) == old.modified_at_ns
+                        && permissions_match(
+                            permissions_from_metadata(&metadata),
+                            old.permissions,
+                        ) =>
+                {
+                    (
+                        old.size,
+                        old.modified_at_ns,
+                        old.sha256.clone(),
+                        old.permissions,
+                    )
+                }
+                _ => hash_stable_file(entry.path(), &metadata)?,
+            };
             files.insert(
                 path,
                 DiscoveredFile {
