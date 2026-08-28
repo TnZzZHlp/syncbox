@@ -23,6 +23,7 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
+use tracing::{debug, error, info, warn};
 
 use crate::{
     identity::DeviceIdentity,
@@ -58,6 +59,7 @@ struct ActiveShare {
     paths: DataPaths,
     share_id: ShareId,
     config: Arc<RwLock<ShareConfig>>,
+    receive_lock: Arc<Mutex<()>>,
     operation_lock: Arc<Mutex<()>>,
     status_lock: Arc<std::sync::Mutex<()>>,
     local_endpoint_id: EndpointId,
@@ -108,6 +110,10 @@ pub async fn run(
         return Ok(());
     }
 
+    info!(
+        shares = registry.shares.len(),
+        once, "starting synchronization"
+    );
     for share in registry.values() {
         set_runtime_state(&share, RuntimeState::Starting, SyncHealth::Unknown, None)?;
     }
@@ -118,8 +124,15 @@ pub async fn run(
         .bind()
         .await
     {
-        Ok(endpoint) => endpoint,
+        Ok(endpoint) => {
+            info!("Iroh endpoint started");
+            endpoint
+        }
         Err(error) => {
+            error!(
+                error = %format_args!("{error:#}"),
+                "unable to start the global Iroh endpoint"
+            );
             for share in registry.values() {
                 let _ = set_runtime_error(&share, "unable to start Iroh endpoint");
             }
@@ -135,6 +148,7 @@ pub async fn run(
     endpoint.close().await;
     accept_task.abort();
     let _ = accept_task.await;
+    info!("synchronization stopped");
     result
 }
 
@@ -161,27 +175,38 @@ pub async fn attempt_initial_sync(
         SyncHealth::Pending,
         None,
     )?;
-    let Ok(endpoint) = Endpoint::builder(presets::N0)
+    let endpoint = match Endpoint::builder(presets::N0)
         .secret_key(identity.secret_key())
         .alpns(vec![SYNCBOX_ALPN.to_vec()])
         .bind()
         .await
-    else {
-        set_runtime_state(
-            &share,
-            RuntimeState::WaitingForPeers,
-            SyncHealth::Offline,
-            None,
-        )?;
-        return Ok(false);
+    {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            warn!(
+                share_id = %share_id,
+                error = %format_args!("{error:#}"),
+                "unable to start Iroh endpoint for initial sync"
+            );
+            set_runtime_state(
+                &share,
+                RuntimeState::WaitingForPeers,
+                SyncHealth::Offline,
+                None,
+            )?;
+            return Ok(false);
+        }
     };
     let result = sync_known_peers(&endpoint, &share).await;
     endpoint.close().await;
-    if let Ok(outcome) = result {
-        if outcome.connected {
+    match result {
+        Ok(outcome) if outcome.connected => {
+            info!(share_id = %share_id, "initial synchronization connected");
             set_stopped(&share)?;
             Ok(true)
-        } else {
+        }
+        Ok(_) => {
+            info!(share_id = %share_id, "initial synchronization found no online peers");
             set_runtime_state(
                 &share,
                 RuntimeState::WaitingForPeers,
@@ -190,14 +215,20 @@ pub async fn attempt_initial_sync(
             )?;
             Ok(false)
         }
-    } else {
-        set_runtime_state(
-            &share,
-            RuntimeState::WaitingForPeers,
-            SyncHealth::Offline,
-            None,
-        )?;
-        Ok(false)
+        Err(error) => {
+            warn!(
+                share_id = %share_id,
+                error = %format_args!("{error:#}"),
+                "initial synchronization failed"
+            );
+            set_runtime_state(
+                &share,
+                RuntimeState::WaitingForPeers,
+                SyncHealth::Offline,
+                None,
+            )?;
+            Ok(false)
+        }
     }
 }
 
@@ -215,6 +246,7 @@ fn load_registry(
                 paths: paths.clone(),
                 share_id: *share_id,
                 config: Arc::new(RwLock::new(config)),
+                receive_lock: Arc::new(Mutex::new(())),
                 operation_lock: Arc::new(Mutex::new(())),
                 status_lock: Arc::new(std::sync::Mutex::new(())),
                 local_endpoint_id: endpoint_id,
@@ -241,10 +273,31 @@ fn spawn_accept_loop(endpoint: Endpoint, registry: ShareRegistry) -> JoinHandle<
             let registry = registry.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let Ok(Ok(connection)) = timeout(HANDSHAKE_TIMEOUT, incoming).await else {
-                    return;
+                let connection = match timeout(HANDSHAKE_TIMEOUT, incoming).await {
+                    Ok(Ok(connection)) => connection,
+                    Ok(Err(error)) => {
+                        warn!(
+                            error = %format_args!("{error:#}"),
+                            "incoming connection failed during handshake"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %format_args!("{error:#}"),
+                            "incoming connection handshake timed out"
+                        );
+                        return;
+                    }
                 };
-                let _ = handle_incoming(connection, registry).await;
+                let peer_endpoint_id = connection.remote_id();
+                if let Err(error) = handle_incoming(connection, registry).await {
+                    warn!(
+                        peer_endpoint_id = %peer_endpoint_id,
+                        error = %format_args!("{error:#}"),
+                        "incoming synchronization failed"
+                    );
+                }
             });
         }
     })
@@ -330,7 +383,13 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 
 async fn run_sync_cycle(endpoint: &Endpoint, registry: &ShareRegistry) {
     for share in registry.values() {
-        let _ = sync_active_share(endpoint, &share).await;
+        if let Err(error) = sync_active_share(endpoint, &share).await {
+            error!(
+                share_id = %share.share_id,
+                error = %format_args!("{error:#}"),
+                "synchronization cycle failed"
+            );
+        }
     }
 }
 
@@ -369,6 +428,7 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
     candidates.retain(|endpoint_id| *endpoint_id != share.local_endpoint_id);
     candidates.truncate(4);
     if candidates.is_empty() {
+        debug!(share_id = %share.share_id, "no known peers available for synchronization");
         set_runtime_state(
             share,
             RuntimeState::WaitingForPeers,
@@ -378,6 +438,11 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
         return Ok(SyncOutcome::default());
     }
 
+    info!(
+        share_id = %share.share_id,
+        candidates = candidates.len(),
+        "starting synchronization with known peers"
+    );
     set_runtime_state(
         share,
         RuntimeState::Synchronizing,
@@ -387,20 +452,49 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
     let mut outcome = SyncOutcome::default();
     let mut had_connection_error = false;
     for peer in candidates {
-        if let Ok(Ok(peer_outcome)) =
-            timeout(SYNC_EXCHANGE_TIMEOUT, sync_with_peer(endpoint, share, peer)).await
-        {
-            outcome.connected = true;
-            outcome.connected_peers = outcome.connected_peers.saturating_add(1);
-            outcome.pending_downloads = outcome
-                .pending_downloads
-                .saturating_add(peer_outcome.pending_downloads);
-            outcome.pending_updates = outcome
-                .pending_updates
-                .saturating_add(peer_outcome.pending_updates);
-        } else {
-            had_connection_error = true;
-            set_runtime_error(share, "could not connect to a known peer")?;
+        info!(
+            share_id = %share.share_id,
+            peer_endpoint_id = %peer,
+            "starting peer synchronization"
+        );
+        match timeout(SYNC_EXCHANGE_TIMEOUT, sync_with_peer(endpoint, share, peer)).await {
+            Ok(Ok(peer_outcome)) => {
+                info!(
+                    share_id = %share.share_id,
+                    peer_endpoint_id = %peer,
+                    pending_downloads = peer_outcome.pending_downloads,
+                    pending_updates = peer_outcome.pending_updates,
+                    "peer synchronization completed"
+                );
+                outcome.connected = true;
+                outcome.connected_peers = outcome.connected_peers.saturating_add(1);
+                outcome.pending_downloads = outcome
+                    .pending_downloads
+                    .saturating_add(peer_outcome.pending_downloads);
+                outcome.pending_updates = outcome
+                    .pending_updates
+                    .saturating_add(peer_outcome.pending_updates);
+            }
+            Ok(Err(error)) => {
+                had_connection_error = true;
+                warn!(
+                    share_id = %share.share_id,
+                    peer_endpoint_id = %peer,
+                    error = %format_args!("{error:#}"),
+                    "peer synchronization failed"
+                );
+                set_runtime_error(share, "could not connect to a known peer")?;
+            }
+            Err(error) => {
+                had_connection_error = true;
+                warn!(
+                    share_id = %share.share_id,
+                    peer_endpoint_id = %peer,
+                    error = %format_args!("{error:#}"),
+                    "peer synchronization timed out"
+                );
+                set_runtime_error(share, "could not connect to a known peer")?;
+            }
         }
     }
     if outcome.connected {
@@ -433,6 +527,13 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
             had_connection_error.then_some("could not connect to a known peer"),
         )?;
     }
+    info!(
+        share_id = %share.share_id,
+        connected_peers = outcome.connected_peers,
+        pending_downloads = outcome.pending_downloads,
+        pending_updates = outcome.pending_updates,
+        "synchronization with known peers finished"
+    );
     Ok(outcome)
 }
 
@@ -442,6 +543,11 @@ async fn sync_with_peer(
     expected_peer: EndpointId,
 ) -> Result<PeerSyncOutcome> {
     let config = share.config()?;
+    info!(
+        share_id = %share.share_id,
+        peer_endpoint_id = %expected_peer,
+        "connecting to peer"
+    );
     let connection = timeout(
         CONNECT_TIMEOUT,
         endpoint.connect(expected_peer, SYNCBOX_ALPN),
@@ -452,6 +558,11 @@ async fn sync_with_peer(
     if connection.remote_id() != expected_peer {
         bail!("connected Iroh endpoint does not match the expected peer");
     }
+    info!(
+        share_id = %share.share_id,
+        peer_endpoint_id = %expected_peer,
+        "connected to peer"
+    );
     update_runtime(share, |status, now_ms| {
         status.connected_peers = 1;
         status.last_connection_at_ms = Some(now_ms);
@@ -474,19 +585,25 @@ async fn sync_with_peer(
         &expected_peer,
         nonce,
     )?;
+    info!(
+        share_id = %share.share_id,
+        peer_endpoint_id = %expected_peer,
+        "peer authentication completed"
+    );
 
     let outbound_manifest = if config.initial_sync_complete {
         share.paths.load_manifest(share.share_id)?
     } else {
         Manifest::empty(share.share_id, current_time_ms())
     };
+    let outbound_digest = outbound_manifest.sync_digest(share.share_id)?;
     let known_peers = known_peer_strings(share, &expected_peer)?;
     write_json_frame(
         &mut send,
         &SyncRequest {
             protocol_version: PROTOCOL_VERSION,
             share_id: share.share_id,
-            manifest: outbound_manifest.clone(),
+            manifest_digest: outbound_digest,
             known_peers,
         },
     )
@@ -498,19 +615,94 @@ async fn sync_with_peer(
         let _operation_lock = share.operation_lock.lock().await;
         merge_remote_peers(share, response.known_peers.iter(), Some(expected_peer))?;
     }
+    if response.manifest_digest == outbound_digest {
+        if !config.initial_sync_complete {
+            let _operation_lock = share.operation_lock.lock().await;
+            let mut updated_config = share.config()?;
+            if !updated_config.initial_sync_complete {
+                updated_config.initial_sync_complete = true;
+                share.paths.save_config(&updated_config)?;
+                share.replace_config(updated_config.clone())?;
+                scan_and_save(share, &updated_config)?;
+            }
+        }
+        send.finish()
+            .context("unable to finish unchanged sync stream")?;
+        connection.close(0_u8.into(), b"sync unchanged");
+        info!(
+            share_id = %share.share_id,
+            peer_endpoint_id = %expected_peer,
+            "peer manifests are unchanged"
+        );
+        return Ok(PeerSyncOutcome {
+            pending_downloads: 0,
+            pending_updates: 0,
+        });
+    }
+
+    info!(
+        share_id = %share.share_id,
+        peer_endpoint_id = %expected_peer,
+        files = outbound_manifest.entries.len(),
+        directories = outbound_manifest.directories.len(),
+        symlinks = outbound_manifest.symlinks.len(),
+        tombstones = outbound_manifest.tombstones.len(),
+        "sending local manifest"
+    );
+    let outbound_message = ManifestMessage {
+        protocol_version: PROTOCOL_VERSION,
+        share_id: share.share_id,
+        manifest: outbound_manifest,
+    };
+    write_json_frame(&mut send, &outbound_message).await?;
+    let remote_message: ManifestMessage = read_json_frame(&mut recv).await?;
+    validate_manifest_message(&remote_message, share.share_id, &response.manifest_digest)?;
+    info!(
+        share_id = %share.share_id,
+        peer_endpoint_id = %expected_peer,
+        files = remote_message.manifest.entries.len(),
+        directories = remote_message.manifest.directories.len(),
+        symlinks = remote_message.manifest.symlinks.len(),
+        tombstones = remote_message.manifest.tombstones.len(),
+        "received peer manifest"
+    );
+
     let (transfer, pending_updates) = {
         let _operation_lock = share.operation_lock.lock().await;
-        make_transfer_request(share, &outbound_manifest, &response.manifest)?
+        make_transfer_request(share, &outbound_message.manifest, &remote_message.manifest)?
     };
+    info!(
+        share_id = %share.share_id,
+        peer_endpoint_id = %expected_peer,
+        uploads = transfer.uploads.len(),
+        downloads = transfer.download_paths.len(),
+        pending_updates,
+        "prepared transfer request"
+    );
     write_json_frame(&mut send, &transfer).await?;
     let ready: TransferReady = read_json_frame(&mut recv).await?;
     validate_transfer_ready(&ready, share.share_id, &transfer.uploads)?;
-    send_upload_chunks(share, &transfer.uploads, &ready.uploads, &mut send).await?;
+    send_upload_chunks(
+        share,
+        expected_peer,
+        &transfer.uploads,
+        &ready.uploads,
+        &mut send,
+    )
+    .await?;
     send.finish().context("unable to finish upload stream")?;
     let final_response: TransferResponse = read_json_frame(&mut recv).await?;
     validate_transfer_response(&final_response, share.share_id)?;
-    let completed = receive_download_chunks(share, &final_response.files, &mut recv).await?;
+    info!(
+        share_id = %share.share_id,
+        peer_endpoint_id = %expected_peer,
+        downloads = final_response.files.len(),
+        "received transfer response"
+    );
     let applied = {
+        let _receive_lock = share.receive_lock.lock().await;
+        let completed =
+            receive_download_chunks(share, expected_peer, &final_response.files, &mut recv).await?;
         let _operation_lock = share.operation_lock.lock().await;
         let applied = apply_remote_staged_transfer(share, &final_response.manifest, &completed)?;
         if applied.applied_records > 0 {
@@ -529,9 +721,21 @@ async fn sync_with_peer(
             // versions.
             scan_and_save(share, &updated_config)?;
         }
+        info!(
+            share_id = %share.share_id,
+            peer_endpoint_id = %expected_peer,
+            applied_records = applied.applied_records,
+            pending_downloads = applied.pending_downloads,
+            "applied peer transfer"
+        );
         applied
     };
     connection.close(0_u8.into(), b"sync complete");
+    info!(
+        share_id = %share.share_id,
+        peer_endpoint_id = %expected_peer,
+        "peer synchronization finished"
+    );
     Ok(PeerSyncOutcome {
         pending_downloads: applied.pending_downloads,
         pending_updates,
@@ -539,6 +743,11 @@ async fn sync_with_peer(
 }
 
 async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Result<()> {
+    let peer_endpoint_id = connection.remote_id();
+    info!(
+        peer_endpoint_id = %peer_endpoint_id,
+        "accepted incoming synchronization connection"
+    );
     let (mut send, mut recv) = timeout(HANDSHAKE_TIMEOUT, connection.accept_bi())
         .await
         .context("timed out waiting for sync stream")?
@@ -553,13 +762,18 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
     validate_client_hello(
         &client_hello,
         &config,
-        &connection.remote_id(),
+        &peer_endpoint_id,
         &share.local_endpoint_id,
     )?;
+    info!(
+        share_id = %share.share_id,
+        peer_endpoint_id = %peer_endpoint_id,
+        "incoming peer authentication completed"
+    );
     let server_nonce: [u8; 32] = rand::rng().random();
     let server_hello = make_server_hello(
         &config,
-        &connection.remote_id(),
+        &peer_endpoint_id,
         &share.local_endpoint_id,
         client_hello.nonce,
         server_nonce,
@@ -572,47 +786,104 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
     validate_sync_request(&request, share.share_id)?;
     let (local_manifest, known_peers) = {
         let _operation_lock = share.operation_lock.lock().await;
-        merge_remote_peers(
-            &share,
-            request.known_peers.iter(),
-            Some(connection.remote_id()),
-        )?;
+        merge_remote_peers(&share, request.known_peers.iter(), Some(peer_endpoint_id))?;
         let local_manifest = share.paths.load_manifest(share.share_id)?;
-        let known_peers = known_peer_strings(&share, &connection.remote_id())?;
+        let known_peers = known_peer_strings(&share, &peer_endpoint_id)?;
         (local_manifest, known_peers)
     };
+    let local_digest = local_manifest.sync_digest(share.share_id)?;
     write_json_frame(
         &mut send,
         &SyncResponse {
             protocol_version: PROTOCOL_VERSION,
             share_id: share.share_id,
-            manifest: local_manifest.clone(),
+            manifest_digest: local_digest,
             known_peers,
         },
     )
     .await?;
 
+    if request.manifest_digest == local_digest {
+        send.finish()
+            .context("unable to finish unchanged sync stream")?;
+        let _ = timeout(Duration::from_secs(5), send.stopped()).await;
+        update_runtime(&share, |status, now_ms| {
+            status.last_connection_at_ms = Some(now_ms);
+            status.pending_downloads = 0;
+        })?;
+        info!(
+            share_id = %share.share_id,
+            peer_endpoint_id = %peer_endpoint_id,
+            "incoming peer manifest is unchanged"
+        );
+        return Ok(());
+    }
+
+    let remote_message: ManifestMessage = read_json_frame(&mut recv).await?;
+    validate_manifest_message(&remote_message, share.share_id, &request.manifest_digest)?;
+    info!(
+        share_id = %share.share_id,
+        peer_endpoint_id = %peer_endpoint_id,
+        files = remote_message.manifest.entries.len(),
+        directories = remote_message.manifest.directories.len(),
+        symlinks = remote_message.manifest.symlinks.len(),
+        tombstones = remote_message.manifest.tombstones.len(),
+        "received incoming peer manifest"
+    );
+    let local_message = ManifestMessage {
+        protocol_version: PROTOCOL_VERSION,
+        share_id: share.share_id,
+        manifest: local_manifest,
+    };
+    write_json_frame(&mut send, &local_message).await?;
+    info!(
+        share_id = %share.share_id,
+        peer_endpoint_id = %peer_endpoint_id,
+        files = local_message.manifest.entries.len(),
+        directories = local_message.manifest.directories.len(),
+        symlinks = local_message.manifest.symlinks.len(),
+        tombstones = local_message.manifest.tombstones.len(),
+        "sent local manifest to incoming peer"
+    );
+
     let transfer: TransferRequest = read_json_frame(&mut recv).await?;
-    validate_transfer_request(&transfer, share.share_id)?;
-    let ready = make_transfer_ready(&share, &transfer)?;
-    write_json_frame(&mut send, &ready).await?;
-    let uploaded = receive_upload_chunks(
-        &share,
-        share.share_id,
-        &transfer.uploads,
-        &ready.uploads,
-        &mut recv,
-    )
-    .await?;
+    validate_transfer_request(&transfer, share.share_id, &remote_message.manifest)?;
+    info!(
+        share_id = %share.share_id,
+        peer_endpoint_id = %peer_endpoint_id,
+        uploads = transfer.uploads.len(),
+        downloads = transfer.download_paths.len(),
+        "received transfer request"
+    );
     let (applied, final_manifest, files) = {
+        let _receive_lock = share.receive_lock.lock().await;
+        let ready = make_transfer_ready(&share, &transfer, &remote_message.manifest)?;
+        write_json_frame(&mut send, &ready).await?;
+        let uploaded = receive_upload_chunks(
+            &share,
+            peer_endpoint_id,
+            share.share_id,
+            &transfer.uploads,
+            &ready.uploads,
+            &mut recv,
+        )
+        .await?;
         let _operation_lock = share.operation_lock.lock().await;
-        let applied = apply_remote_staged_transfer(&share, &transfer.manifest, &uploaded)?;
+        let applied = apply_remote_staged_transfer(&share, &remote_message.manifest, &uploaded)?;
         let final_manifest = share.paths.load_manifest(share.share_id)?;
         let files = build_transfer_files(
             &final_manifest,
             &transfer.download_paths,
             &transfer.download_resumes,
         )?;
+        info!(
+            share_id = %share.share_id,
+            peer_endpoint_id = %peer_endpoint_id,
+            applied_records = applied.applied_records,
+            pending_downloads = applied.pending_downloads,
+            response_files = files.len(),
+            "applied incoming peer transfer"
+        );
         (applied, final_manifest, files)
     };
     write_json_frame(
@@ -625,7 +896,7 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
         },
     )
     .await?;
-    send_file_chunks_from_root(&share, &files, &mut send).await?;
+    send_file_chunks_from_root(&share, peer_endpoint_id, &files, &mut send).await?;
     send.finish()
         .context("unable to finish sync response stream")?;
     // Keep the connection alive until the client has acknowledged the final response. Dropping an
@@ -638,6 +909,11 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
         }
         status.pending_downloads = applied.pending_downloads;
     })?;
+    info!(
+        share_id = %share.share_id,
+        peer_endpoint_id = %peer_endpoint_id,
+        "incoming synchronization finished"
+    );
     Ok(())
 }
 
@@ -646,7 +922,7 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
 struct SyncRequest {
     protocol_version: u16,
     share_id: ShareId,
-    manifest: Manifest,
+    manifest_digest: [u8; 32],
     known_peers: Vec<String>,
 }
 
@@ -655,8 +931,16 @@ struct SyncRequest {
 struct SyncResponse {
     protocol_version: u16,
     share_id: ShareId,
-    manifest: Manifest,
+    manifest_digest: [u8; 32],
     known_peers: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestMessage {
+    protocol_version: u16,
+    share_id: ShareId,
+    manifest: Manifest,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -664,7 +948,6 @@ struct SyncResponse {
 struct TransferRequest {
     protocol_version: u16,
     share_id: ShareId,
-    manifest: Manifest,
     download_paths: Vec<String>,
     download_resumes: Vec<TransferFile>,
     uploads: Vec<TransferFile>,
@@ -718,7 +1001,6 @@ fn validate_sync_request(request: &SyncRequest, share_id: ShareId) -> Result<()>
     if request.protocol_version != PROTOCOL_VERSION || request.share_id != share_id {
         bail!("sync request has an incompatible protocol or share ID");
     }
-    request.manifest.validate(share_id)?;
     validate_wire_peers(&request.known_peers)
 }
 
@@ -726,17 +1008,34 @@ fn validate_sync_response(response: &SyncResponse, share_id: ShareId) -> Result<
     if response.protocol_version != PROTOCOL_VERSION || response.share_id != share_id {
         bail!("sync response has an incompatible protocol or share ID");
     }
-    response.manifest.validate(share_id)?;
     validate_wire_peers(&response.known_peers)
 }
 
-fn validate_transfer_request(request: &TransferRequest, share_id: ShareId) -> Result<()> {
+fn validate_manifest_message(
+    message: &ManifestMessage,
+    share_id: ShareId,
+    expected_digest: &[u8; 32],
+) -> Result<()> {
+    if message.protocol_version != PROTOCOL_VERSION || message.share_id != share_id {
+        bail!("manifest message has an incompatible protocol or share ID");
+    }
+    if message.manifest.sync_digest(share_id)? != *expected_digest {
+        bail!("manifest message does not match its advertised digest");
+    }
+    Ok(())
+}
+
+fn validate_transfer_request(
+    request: &TransferRequest,
+    share_id: ShareId,
+    manifest: &Manifest,
+) -> Result<()> {
     if request.protocol_version != PROTOCOL_VERSION || request.share_id != share_id {
         bail!("file transfer request has an incompatible protocol or share ID");
     }
-    request.manifest.validate(share_id)?;
+    manifest.validate(share_id)?;
     validate_path_list(&request.download_paths)?;
-    validate_transfer_files(&request.uploads, &request.manifest)?;
+    validate_transfer_files(&request.uploads, manifest)?;
     validate_transfer_file_shapes(&request.download_resumes)?;
     let requested_downloads = request.download_paths.iter().collect::<HashSet<_>>();
     for resume in &request.download_resumes {
@@ -944,7 +1243,6 @@ fn make_transfer_request(
         TransferRequest {
             protocol_version: PROTOCOL_VERSION,
             share_id: share.share_id,
-            manifest: local.clone(),
             download_paths,
             download_resumes,
             uploads,
@@ -1050,8 +1348,9 @@ fn partial_size(
 fn make_transfer_ready(
     share: &Arc<ActiveShare>,
     request: &TransferRequest,
+    manifest: &Manifest,
 ) -> Result<TransferReady> {
-    validate_transfer_files(&request.uploads, &request.manifest)?;
+    validate_transfer_files(&request.uploads, manifest)?;
     let uploads = request
         .uploads
         .iter()
@@ -1103,6 +1402,7 @@ fn build_transfer_files(
 
 async fn send_upload_chunks(
     share: &Arc<ActiveShare>,
+    peer_endpoint_id: EndpointId,
     requested: &[TransferFile],
     ready: &[TransferFile],
     send: &mut SendStream,
@@ -1120,16 +1420,25 @@ async fn send_upload_chunks(
             bail!("upload resume metadata does not match the request");
         }
     }
-    send_file_chunks_from_root(share, ready, send).await
+    send_file_chunks_from_root(share, peer_endpoint_id, ready, send).await
 }
 
 async fn send_file_chunks_from_root(
     share: &Arc<ActiveShare>,
+    peer_endpoint_id: EndpointId,
     files: &[TransferFile],
     send: &mut SendStream,
 ) -> Result<()> {
     let root = config_root(&share.config()?)?;
     for file in files {
+        debug!(
+            share_id = %share.share_id,
+            peer_endpoint_id = %peer_endpoint_id,
+            path = %file.path,
+            size = file.size,
+            offset = file.offset,
+            "starting file upload"
+        );
         let target = safe_local_path(&root, &file.path, false)?;
         let metadata = fs::symlink_metadata(&target)
             .with_context(|| format!("unable to inspect shared file {}", target.display()))?;
@@ -1178,6 +1487,14 @@ async fn send_file_chunks_from_root(
                 target.display()
             );
         }
+        debug!(
+            share_id = %share.share_id,
+            peer_endpoint_id = %peer_endpoint_id,
+            path = %file.path,
+            size = file.size,
+            offset = file.offset,
+            "completed file upload"
+        );
     }
     Ok(())
 }
@@ -1236,21 +1553,40 @@ fn verify_partial(path: &Path, file: &TransferFile) -> Result<()> {
         hasher.update(&buffer[..count]);
     }
     if hex::encode(hasher.finalize()) != file.sha256 {
-        bail!("transfer partial hash does not match its manifest");
+        fs::remove_file(path).with_context(|| {
+            format!(
+                "transfer partial hash does not match its manifest for {}; unable to remove invalid transfer partial",
+                file.path
+            )
+        })?;
+        bail!(
+            "transfer partial hash does not match its manifest for {}",
+            file.path
+        );
     }
     Ok(())
 }
 
 async fn receive_file_chunks(
     share: &Arc<ActiveShare>,
+    peer_endpoint_id: EndpointId,
     files: &[TransferFile],
     recv: &mut RecvStream,
 ) -> Result<Vec<CompletedFile>> {
     validate_transfer_file_shapes(files)?;
     let mut completed = Vec::new();
     for file in files {
+        debug!(
+            share_id = %share.share_id,
+            peer_endpoint_id = %peer_endpoint_id,
+            path = %file.path,
+            size = file.size,
+            offset = file.offset,
+            "starting file receive"
+        );
         let partial = partial_path(share, &file.path, &file.sha256);
-        let mut destination = ensure_partial_file(&partial, file.offset)?;
+        let mut destination = ensure_partial_file(&partial, file.offset)
+            .with_context(|| format!("unable to prepare transfer for {}", file.path))?;
         destination
             .seek(SeekFrom::Start(file.offset))
             .with_context(|| format!("unable to seek transfer partial {}", partial.display()))?;
@@ -1283,20 +1619,30 @@ async fn receive_file_chunks(
             file: file.clone(),
             staged_path: partial,
         });
+        debug!(
+            share_id = %share.share_id,
+            peer_endpoint_id = %peer_endpoint_id,
+            path = %file.path,
+            size = file.size,
+            offset = file.offset,
+            "completed file receive"
+        );
     }
     Ok(completed)
 }
 
 async fn receive_download_chunks(
     share: &Arc<ActiveShare>,
+    peer_endpoint_id: EndpointId,
     files: &[TransferFile],
     recv: &mut RecvStream,
 ) -> Result<Vec<CompletedFile>> {
-    receive_file_chunks(share, files, recv).await
+    receive_file_chunks(share, peer_endpoint_id, files, recv).await
 }
 
 async fn receive_upload_chunks(
     share: &Arc<ActiveShare>,
+    peer_endpoint_id: EndpointId,
     share_id: ShareId,
     requested: &[TransferFile],
     ready: &[TransferFile],
@@ -1311,7 +1657,7 @@ async fn receive_upload_chunks(
         share_id,
         requested,
     )?;
-    receive_file_chunks(share, ready, recv).await
+    receive_file_chunks(share, peer_endpoint_id, ready, recv).await
 }
 
 #[allow(dead_code)]
@@ -1508,6 +1854,12 @@ fn apply_remote_transfer_impl(
         observe_manifest_clock(share, &candidate)?;
         share.paths.save_manifest(&candidate)?;
     }
+    debug!(
+        share_id = %share.share_id,
+        applied_records,
+        pending_downloads,
+        "remote transfer apply finished"
+    );
     Ok(ApplyOutcome {
         pending_downloads,
         applied_records,
@@ -1551,6 +1903,17 @@ fn scan_and_save(share: &Arc<ActiveShare>, config: &ShareConfig) -> Result<()> {
     let clock = share.paths.load_clock(share.share_id)?;
     let now_ms = current_time_ms();
     let scanned = scan_manifest(&root, &manifest, clock, &share.local_endpoint_id, now_ms)?;
+    if scanned.changes > 0 {
+        info!(
+            share_id = %share.share_id,
+            files = scanned.files,
+            tombstones = scanned.tombstones,
+            changes = scanned.changes,
+            "local scan detected changes"
+        );
+    } else {
+        debug!(share_id = %share.share_id, "local scan found no changes");
+    }
     share.paths.save_clock(share.share_id, &scanned.clock)?;
     share.paths.save_manifest(&scanned.manifest)?;
     update_runtime(share, |status, _| {
@@ -1833,8 +2196,10 @@ fn write_local_staged_file(
         match fs::rename(staged_path, &target) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
-                fs::copy(staged_path, &target).with_context(|| {
-                    format!("unable to install staged file {}", target.display())
+                with_writable_cross_device_target(&target, permissions, || {
+                    fs::copy(staged_path, &target).map(|_| ()).with_context(|| {
+                        format!("unable to install staged file {}", target.display())
+                    })
                 })?;
                 fs::remove_file(staged_path).with_context(|| {
                     format!("unable to remove staged file {}", staged_path.display())
@@ -2187,11 +2552,11 @@ fn set_permissions(_target: &Path, _permissions: u16, _directory: bool) -> Resul
 }
 
 #[cfg(unix)]
-fn write_cross_device_target(
+fn with_writable_cross_device_target<T>(
     target: &Path,
-    bytes: &[u8],
     final_permissions: Option<u16>,
-) -> Result<()> {
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let restore_permissions = match fs::symlink_metadata(target) {
@@ -2223,9 +2588,8 @@ fn write_cross_device_target(
                 .with_context(|| format!("unable to inspect shared file {}", target.display()));
         }
     };
-    let write_result = fs::write(target, bytes)
-        .with_context(|| format!("unable to install downloaded file {}", target.display()));
-    if (write_result.is_err() || final_permissions.is_none())
+    let operation_result = operation();
+    if (operation_result.is_err() || final_permissions.is_none())
         && let Some(permissions) = restore_permissions
     {
         fs::set_permissions(target, fs::Permissions::from_mode(permissions)).with_context(
@@ -2237,17 +2601,27 @@ fn write_cross_device_target(
             },
         )?;
     }
-    write_result
+    operation_result
 }
 
 #[cfg(not(unix))]
+fn with_writable_cross_device_target<T>(
+    _target: &Path,
+    _final_permissions: Option<u16>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    operation()
+}
+
 fn write_cross_device_target(
     target: &Path,
     bytes: &[u8],
-    _final_permissions: Option<u16>,
+    final_permissions: Option<u16>,
 ) -> Result<()> {
-    fs::write(target, bytes)
-        .with_context(|| format!("unable to install downloaded file {}", target.display()))
+    with_writable_cross_device_target(target, final_permissions, || {
+        fs::write(target, bytes)
+            .with_context(|| format!("unable to install downloaded file {}", target.display()))
+    })
 }
 
 fn update_runtime<F>(share: &Arc<ActiveShare>, update: F) -> Result<()>
@@ -2561,17 +2935,21 @@ async fn read_json_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T
 mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(unix)]
     use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 
     use iroh::SecretKey;
+    #[cfg(unix)]
     use tempfile::TempDir;
 
     use super::*;
+    use crate::types::{FORMAT_VERSION, ShareSecret};
+    #[cfg(unix)]
     use crate::{
         manifest::{
             DirectoryEntry, MANIFEST_FORMAT_VERSION, ManifestEntry, SymlinkEntry, Tombstone,
         },
-        types::{ClockState, FORMAT_VERSION, HlcTimestamp, KnownPeers, RuntimeStatus, ShareSecret},
+        types::{ClockState, HlcTimestamp, KnownPeers, RuntimeStatus},
     };
 
     fn config() -> (ShareConfig, EndpointId, EndpointId) {
@@ -2600,6 +2978,73 @@ mod tests {
         let mut other = config;
         other.share_id = ShareId([8; 32]);
         assert_ne!(proof, client_proof(&other, &client, &server, [7; 32]));
+    }
+
+    #[test]
+    fn sync_request_carries_only_the_manifest_digest() {
+        let share_id = ShareId([42; 32]);
+        let manifest = Manifest::empty(share_id, 1);
+        let digest = manifest.sync_digest(share_id).unwrap();
+        let request = SyncRequest {
+            protocol_version: PROTOCOL_VERSION,
+            share_id,
+            manifest_digest: digest,
+            known_peers: Vec::new(),
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+
+        assert!(encoded.get("manifest").is_none());
+        assert!(encoded.get("manifest_digest").is_some());
+        validate_sync_request(&request, share_id).unwrap();
+        validate_manifest_message(
+            &ManifestMessage {
+                protocol_version: PROTOCOL_VERSION,
+                share_id,
+                manifest,
+            },
+            share_id,
+            &digest,
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transfer_request_reuses_authenticated_manifest() {
+        let share_id = ShareId([40; 32]);
+        let endpoint = SecretKey::from_bytes(&[41; 32]).public();
+        let bytes = b"payload";
+        let manifest = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 1,
+            entries: BTreeMap::from([(
+                "file.txt".to_owned(),
+                file_entry(bytes, 0o640, timestamp(1, endpoint)),
+            )]),
+            directories: BTreeMap::new(),
+            symlinks: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
+        };
+        let request = TransferRequest {
+            protocol_version: PROTOCOL_VERSION,
+            share_id,
+            download_paths: Vec::new(),
+            download_resumes: Vec::new(),
+            uploads: vec![TransferFile {
+                path: "file.txt".to_owned(),
+                sha256: manifest.entries["file.txt"].sha256.clone(),
+                size: bytes.len() as u64,
+                offset: 0,
+            }],
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+
+        assert!(encoded.get("manifest").is_none());
+        validate_transfer_request(&request, share_id, &manifest).unwrap();
+        assert!(
+            validate_transfer_request(&request, share_id, &Manifest::empty(share_id, 2)).is_err()
+        );
     }
 
     #[test]
@@ -2661,6 +3106,7 @@ mod tests {
             paths,
             share_id: manifest.share_id,
             config: Arc::new(RwLock::new(config)),
+            receive_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(Mutex::new(())),
             status_lock: Arc::new(std::sync::Mutex::new(())),
             local_endpoint_id: endpoint,
@@ -2698,6 +3144,106 @@ mod tests {
     #[cfg(unix)]
     fn mode(path: &Path) -> u16 {
         (fs::metadata(path).unwrap().permissions().mode() & 0o7777) as u16
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_transfer_partial_resumes_and_survives_verification() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+        let share_id = ShareId([30; 32]);
+        let endpoint = SecretKey::from_bytes(&[31; 32]).public();
+        let share = active_share(&root, Manifest::empty(share_id, 0), endpoint);
+        let bytes = b"valid data";
+        let file = TransferFile {
+            path: "file.txt".to_owned(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+            size: bytes.len() as u64,
+            offset: 0,
+        };
+        let partial = partial_path(&share, &file.path, &file.sha256);
+        fs::write(&partial, &bytes[..5]).unwrap();
+
+        assert_eq!(
+            partial_size(&share, &file.path, &file.sha256, file.size).unwrap(),
+            5
+        );
+        fs::write(&partial, bytes).unwrap();
+        verify_partial(&partial, &file).unwrap();
+        assert!(partial.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_transfer_partial_is_removed_after_hash_mismatch() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+        let share_id = ShareId([32; 32]);
+        let endpoint = SecretKey::from_bytes(&[33; 32]).public();
+        let share = active_share(&root, Manifest::empty(share_id, 0), endpoint);
+        let bytes = b"valid data";
+        let file = TransferFile {
+            path: "file.txt".to_owned(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+            size: bytes.len() as u64,
+            offset: 0,
+        };
+        let partial = partial_path(&share, &file.path, &file.sha256);
+        fs::write(&partial, b"corrupt!!!").unwrap();
+
+        let error = verify_partial(&partial, &file).unwrap_err();
+
+        assert!(format!("{error:#}").contains("file.txt"));
+        assert!(!partial.exists());
+        assert_eq!(
+            partial_size(&share, &file.path, &file.sha256, file.size).unwrap(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_device_copy_temporarily_makes_read_only_target_writable() {
+        let temporary = TempDir::new().unwrap();
+        let target = temporary.path().join("target.txt");
+        let staged = temporary.path().join("staged.part");
+        fs::write(&target, b"old").unwrap();
+        fs::write(&staged, b"new").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+
+        with_writable_cross_device_target(&target, None, || {
+            fs::copy(&staged, &target)
+                .map(|_| ())
+                .context("simulated cross-device copy failed")
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(mode(&target), 0o444);
+        assert!(staged.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_device_copy_restores_permissions_after_failure() {
+        let temporary = TempDir::new().unwrap();
+        let target = temporary.path().join("target.txt");
+        let staged = temporary.path().join("staged.part");
+        fs::write(&target, b"old").unwrap();
+        fs::write(&staged, b"new").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let error = with_writable_cross_device_target(&target, None, || {
+            Err::<(), _>(anyhow!("simulated cross-device copy failure"))
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("simulated cross-device copy failure"));
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert_eq!(mode(&target), 0o444);
+        assert!(staged.exists());
     }
 
     #[cfg(unix)]

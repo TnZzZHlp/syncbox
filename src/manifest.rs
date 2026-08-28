@@ -129,6 +129,78 @@ impl Manifest {
             .cloned()
             .collect()
     }
+
+    /// Hashes only synchronized state. Scan timestamps and local filesystem mtimes are excluded
+    /// because peers can legitimately record different values for the same synchronized content.
+    pub fn sync_digest(&self, expected_share_id: ShareId) -> Result<[u8; 32]> {
+        self.validate(expected_share_id)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"syncbox-manifest-digest-v1\0");
+        hasher.update(&self.format_version.to_be_bytes());
+        hasher.update(self.share_id.as_bytes());
+
+        update_digest_len(&mut hasher, self.entries.len());
+        for (path, entry) in &self.entries {
+            update_digest_bytes(&mut hasher, path.as_bytes());
+            hasher.update(&entry.size.to_be_bytes());
+            update_digest_bytes(&mut hasher, entry.sha256.as_bytes());
+            update_digest_permissions(&mut hasher, entry.permissions);
+            update_digest_timestamp(&mut hasher, entry.version);
+        }
+
+        update_digest_len(&mut hasher, self.directories.len());
+        for (path, entry) in &self.directories {
+            update_digest_bytes(&mut hasher, path.as_bytes());
+            update_digest_permissions(&mut hasher, entry.permissions);
+            update_digest_timestamp(&mut hasher, entry.version);
+        }
+
+        update_digest_len(&mut hasher, self.symlinks.len());
+        for (path, entry) in &self.symlinks {
+            update_digest_bytes(&mut hasher, path.as_bytes());
+            update_digest_bytes(&mut hasher, entry.target.as_bytes());
+            update_digest_timestamp(&mut hasher, entry.version);
+        }
+
+        update_digest_len(&mut hasher, self.tombstones.len());
+        for (path, tombstone) in &self.tombstones {
+            update_digest_bytes(&mut hasher, path.as_bytes());
+            update_digest_timestamp(&mut hasher, tombstone.version);
+        }
+
+        Ok(*hasher.finalize().as_bytes())
+    }
+}
+
+fn update_digest_len(hasher: &mut blake3::Hasher, length: usize) {
+    hasher.update(
+        &u64::try_from(length)
+            .expect("manifest lengths fit in u64")
+            .to_be_bytes(),
+    );
+}
+
+fn update_digest_bytes(hasher: &mut blake3::Hasher, value: &[u8]) {
+    update_digest_len(hasher, value.len());
+    hasher.update(value);
+}
+
+fn update_digest_permissions(hasher: &mut blake3::Hasher, permissions: Option<u16>) {
+    match permissions {
+        Some(permissions) => {
+            hasher.update(&[1]);
+            hasher.update(&permissions.to_be_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}
+
+fn update_digest_timestamp(hasher: &mut blake3::Hasher, timestamp: HlcTimestamp) {
+    hasher.update(&timestamp.wall_ms.to_be_bytes());
+    hasher.update(&timestamp.counter.to_be_bytes());
+    hasher.update(&timestamp.author);
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -278,7 +350,9 @@ pub fn scan_manifest(
 ) -> Result<ScanResult> {
     previous.validate(previous.share_id)?;
     clock.validate()?;
-    let discovered = discover_entries(root, previous)?;
+    // Windows manifests have no POSIX permissions; only legacy manifests should synthesize them.
+    let unknown_permissions_match = previous.format_version != LEGACY_MANIFEST_FORMAT_VERSION;
+    let discovered = discover_entries(root, previous, unknown_permissions_match)?;
     let mut entries = BTreeMap::new();
     let mut directories = BTreeMap::new();
     let mut symlinks = BTreeMap::new();
@@ -290,7 +364,11 @@ pub fn scan_manifest(
         let unchanged = old_entry.is_some_and(|entry| {
             entry.size == discovered_file.size
                 && entry.sha256 == discovered_file.sha256
-                && permissions_match(entry.permissions, discovered_file.permissions)
+                && permissions_match(
+                    entry.permissions,
+                    discovered_file.permissions,
+                    unknown_permissions_match,
+                )
         });
         let entry = if let Some(old_entry) = old_entry.filter(|_| unchanged) {
             // Keep the stored digest/permissions/version, but refresh the recorded
@@ -323,7 +401,11 @@ pub fn scan_manifest(
     for (path, discovered_directory) in &discovered.directories {
         let old_entry = previous.directories.get(path);
         let unchanged = old_entry.is_some_and(|entry| {
-            permissions_match(entry.permissions, discovered_directory.permissions)
+            permissions_match(
+                entry.permissions,
+                discovered_directory.permissions,
+                unknown_permissions_match,
+            )
         });
         let entry = if let Some(old_entry) = old_entry.filter(|_| unchanged) {
             old_entry.clone()
@@ -419,7 +501,11 @@ struct DiscoveredEntries {
     symlinks: BTreeMap<String, DiscoveredSymlink>,
 }
 
-fn discover_entries(root: &Path, previous: &Manifest) -> Result<DiscoveredEntries> {
+fn discover_entries(
+    root: &Path,
+    previous: &Manifest,
+    unknown_permissions_match: bool,
+) -> Result<DiscoveredEntries> {
     let metadata = fs::metadata(root)
         .with_context(|| format!("unable to inspect local directory {}", root.display()))?;
     if !metadata.is_dir() {
@@ -483,6 +569,7 @@ fn discover_entries(root: &Path, previous: &Manifest) -> Result<DiscoveredEntrie
                         && permissions_match(
                             permissions_from_metadata(&metadata),
                             old.permissions,
+                            unknown_permissions_match,
                         ) =>
                 {
                     (
@@ -538,7 +625,7 @@ fn hash_stable_file(
             .with_context(|| format!("unable to inspect local file {}", path.display()))?;
         if after.len() == first_size
             && modified_at_ns(&after) == first_modified
-            && permissions_match(first_permissions, permissions_from_metadata(&after))
+            && permissions_match(first_permissions, permissions_from_metadata(&after), false)
         {
             return Ok((
                 first_size,
@@ -568,12 +655,12 @@ fn permissions_from_metadata(_metadata: &fs::Metadata) -> Option<u16> {
 }
 
 #[cfg(unix)]
-fn permissions_match(left: Option<u16>, right: Option<u16>) -> bool {
-    left == right
+fn permissions_match(left: Option<u16>, right: Option<u16>, unknown_matches: bool) -> bool {
+    (unknown_matches && (left.is_none() || right.is_none())) || left == right
 }
 
 #[cfg(not(unix))]
-fn permissions_match(_left: Option<u16>, _right: Option<u16>) -> bool {
+fn permissions_match(_left: Option<u16>, _right: Option<u16>, _unknown_matches: bool) -> bool {
     true
 }
 
@@ -773,6 +860,35 @@ mod tests {
     }
 
     #[test]
+    fn sync_digest_ignores_local_scan_metadata() {
+        let temporary = TempDir::new().unwrap();
+        fs::write(temporary.path().join("config.txt"), "one").unwrap();
+        let share_id = ShareId([12; 32]);
+        let endpoint = SecretKey::from_bytes(&[13; 32]).public();
+        let scanned = scan_manifest(
+            temporary.path(),
+            &Manifest::empty(share_id, 1),
+            ClockState::new(),
+            &endpoint,
+            2,
+        )
+        .unwrap();
+        let expected = scanned.manifest.sync_digest(share_id).unwrap();
+        let mut local_metadata = scanned.manifest;
+        local_metadata.scanned_at_ms += 1;
+        local_metadata
+            .entries
+            .get_mut("config.txt")
+            .unwrap()
+            .modified_at_ns += 1;
+
+        assert_eq!(local_metadata.sync_digest(share_id).unwrap(), expected);
+
+        local_metadata.entries.get_mut("config.txt").unwrap().sha256 = "0".repeat(64);
+        assert_ne!(local_metadata.sync_digest(share_id).unwrap(), expected);
+    }
+
+    #[test]
     fn unsafe_manifest_paths_are_rejected() {
         for path in ["", "../secret", "/secret", "a\\b", "a/../../b"] {
             assert!(validate_manifest_path(path).is_err(), "{path}");
@@ -874,6 +990,70 @@ mod tests {
         assert_ne!(
             changed.manifest.directories["private"].version,
             unchanged.manifest.directories["private"].version
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_preserves_unknown_permissions_from_windows() {
+        let temporary = TempDir::new().unwrap();
+        let directory = temporary.path().join("private");
+        let file = directory.join("config.txt");
+        fs::create_dir(&directory).unwrap();
+        fs::write(&file, "one").unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        let share_id = ShareId([10; 32]);
+        let endpoint = SecretKey::from_bytes(&[11; 32]).public();
+        let first = scan_manifest(
+            temporary.path(),
+            &Manifest::empty(share_id, 1),
+            ClockState::new(),
+            &endpoint,
+            2,
+        )
+        .unwrap();
+        let mut windows = first.manifest.clone();
+        windows
+            .entries
+            .get_mut("private/config.txt")
+            .unwrap()
+            .permissions = None;
+        windows.directories.get_mut("private").unwrap().permissions = None;
+
+        let rescanned =
+            scan_manifest(temporary.path(), &windows, first.clock, &endpoint, 3).unwrap();
+        assert_eq!(rescanned.changes, 0);
+        assert_eq!(
+            rescanned.manifest.entries["private/config.txt"].version,
+            windows.entries["private/config.txt"].version
+        );
+        assert_eq!(
+            rescanned.manifest.directories["private"].version,
+            windows.directories["private"].version
+        );
+        assert_eq!(
+            rescanned.manifest.entries["private/config.txt"].permissions,
+            None
+        );
+        assert_eq!(rescanned.manifest.directories["private"].permissions, None);
+
+        let fast_path = scan_manifest(
+            temporary.path(),
+            &rescanned.manifest,
+            rescanned.clock,
+            &endpoint,
+            4,
+        )
+        .unwrap();
+        assert_eq!(fast_path.changes, 0);
+        assert_eq!(
+            fast_path.manifest.entries["private/config.txt"].version,
+            rescanned.manifest.entries["private/config.txt"].version
+        );
+        assert_eq!(
+            fast_path.manifest.directories["private"].version,
+            rescanned.manifest.directories["private"].version
         );
     }
 

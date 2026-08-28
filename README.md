@@ -15,9 +15,10 @@ Syncbox is a Rust command-line application for synchronizing multiple independen
 
 ## Upgrades
 
-Protocol version 2 peers do not communicate with version 1 peers. Upgrade every peer in a share as
-one maintenance operation: stop the services, install the same version everywhere, then start them
-again.
+Protocol version 5 peers do not communicate with version 4 peers. Version 5 compares compact
+manifest digests before sending full manifests; version 4 removed a duplicate manifest from
+transfer requests. Upgrade every peer in a share as one maintenance operation: stop the services,
+install the same version everywhere, then start them again.
 
 ## Quick start
 

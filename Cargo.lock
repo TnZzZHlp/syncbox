@@ -3270,6 +3270,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "walkdir",
  "windows-sys 0.61.2",
 ]

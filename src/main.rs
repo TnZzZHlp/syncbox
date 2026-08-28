@@ -3,6 +3,7 @@ use std::{path::PathBuf, process::ExitCode};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use syncbox::app::App;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(
@@ -52,6 +53,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    init_tracing();
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -59,6 +61,15 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn init_tracing() {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("syncbox=info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 async fn run() -> Result<()> {
