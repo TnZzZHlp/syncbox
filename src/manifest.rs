@@ -134,6 +134,11 @@ impl Manifest {
     /// because peers can legitimately record different values for the same synchronized content.
     pub fn sync_digest(&self, expected_share_id: ShareId) -> Result<[u8; 32]> {
         self.validate(expected_share_id)?;
+        Ok(self.sync_digest_after_validation())
+    }
+
+    /// Computes the digest without validation. The caller must validate the manifest first.
+    pub(crate) fn sync_digest_after_validation(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"syncbox-manifest-digest-v1\0");
         hasher.update(&self.format_version.to_be_bytes());
@@ -168,7 +173,7 @@ impl Manifest {
             update_digest_timestamp(&mut hasher, tombstone.version);
         }
 
-        Ok(*hasher.finalize().as_bytes())
+        *hasher.finalize().as_bytes()
     }
 }
 
@@ -337,6 +342,7 @@ pub struct ScanResult {
     pub tombstones: usize,
     pub changes: usize,
     pub changed: bool,
+    pub manifest_changed: bool,
 }
 
 /// Scans a root directory and creates a manifest. State is returned rather than persisted so the
@@ -459,6 +465,11 @@ pub fn scan_manifest(
         }
     }
 
+    let manifest_changed = previous.format_version != MANIFEST_FORMAT_VERSION
+        || previous.entries != entries
+        || previous.directories != directories
+        || previous.symlinks != symlinks
+        || previous.tombstones != tombstones;
     let manifest = Manifest {
         format_version: MANIFEST_FORMAT_VERSION,
         share_id: previous.share_id,
@@ -476,6 +487,7 @@ pub fn scan_manifest(
         clock,
         changes,
         changed: changes > 0,
+        manifest_changed,
     })
 }
 
@@ -857,6 +869,35 @@ mod tests {
             first.manifest.entries["config.txt"].version,
             second.manifest.entries["config.txt"].version
         );
+        assert!(first.manifest_changed);
+        assert!(!second.manifest_changed);
+    }
+
+    #[test]
+    fn scanner_reports_mtime_cache_refresh_without_content_change() {
+        let temporary = TempDir::new().unwrap();
+        fs::write(temporary.path().join("config.txt"), "one").unwrap();
+        let share_id = ShareId([24; 32]);
+        let endpoint = SecretKey::from_bytes(&[25; 32]).public();
+        let first = scan_manifest(
+            temporary.path(),
+            &Manifest::empty(share_id, 1),
+            ClockState::new(),
+            &endpoint,
+            2,
+        )
+        .unwrap();
+        let mut stale = first.manifest.clone();
+        let stale_mtime = stale.entries["config.txt"].modified_at_ns;
+        stale.entries.get_mut("config.txt").unwrap().modified_at_ns = stale_mtime.saturating_add(1);
+
+        let refreshed = scan_manifest(temporary.path(), &stale, first.clock, &endpoint, 3).unwrap();
+        assert_eq!(refreshed.changes, 0);
+        assert!(refreshed.manifest_changed);
+        assert_eq!(
+            refreshed.manifest.entries["config.txt"].sha256,
+            stale.entries["config.txt"].sha256
+        );
     }
 
     #[test]
@@ -874,6 +915,7 @@ mod tests {
         )
         .unwrap();
         let expected = scanned.manifest.sync_digest(share_id).unwrap();
+        assert_eq!(scanned.manifest.sync_digest_after_validation(), expected);
         let mut local_metadata = scanned.manifest;
         local_metadata.scanned_at_ms += 1;
         local_metadata

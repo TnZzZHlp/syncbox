@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
@@ -11,7 +11,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac as _};
 use iroh::{
-    Endpoint, EndpointId,
+    Endpoint, EndpointId, RelayMode,
+    address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher, PkarrResolver},
     endpoint::{Connection, RecvStream, SendStream, presets},
 };
 use rand::Rng as _;
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::{Mutex, Semaphore},
     task::JoinHandle,
     time::timeout,
@@ -49,10 +51,29 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const SYNC_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_INCOMING_HANDLERS: usize = 32;
+// ponytail: four concurrent shares; tune after multi-share throughput measurements.
+const MAX_CONCURRENT_SHARES: usize = 4;
+// ponytail: two concurrent peer sessions; tune after per-share I/O measurements.
+const MAX_CONCURRENT_PEERS: usize = 2;
 const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 type HmacSha256 = Hmac<Sha256>;
+
+async fn bind_endpoint(
+    secret_key: iroh::SecretKey,
+) -> std::result::Result<Endpoint, iroh::endpoint::BindError> {
+    Endpoint::builder(presets::N0DisableRelay)
+        .clear_address_lookup()
+        .address_lookup(PkarrPublisher::n0_dns().addr_filter(AddrFilter::unfiltered()))
+        .address_lookup(PkarrResolver::n0_dns())
+        .address_lookup(DnsAddressLookup::n0_dns())
+        .relay_mode(RelayMode::Disabled)
+        .secret_key(secret_key)
+        .alpns(vec![SYNCBOX_ALPN.to_vec()])
+        .bind()
+        .await
+}
 
 #[derive(Clone)]
 struct ActiveShare {
@@ -118,12 +139,7 @@ pub async fn run(
         set_runtime_state(&share, RuntimeState::Starting, SyncHealth::Unknown, None)?;
     }
 
-    let endpoint = match Endpoint::builder(presets::N0)
-        .secret_key(identity.secret_key())
-        .alpns(vec![SYNCBOX_ALPN.to_vec()])
-        .bind()
-        .await
-    {
+    let endpoint = match bind_endpoint(identity.secret_key()).await {
         Ok(endpoint) => {
             info!("Iroh endpoint started");
             endpoint
@@ -142,12 +158,16 @@ pub async fn run(
 
     let accept_task = spawn_accept_loop(endpoint.clone(), registry.clone());
     let result = run_cycles(&endpoint, &registry, once).await;
+    endpoint.close().await;
+    if let Err(error) = accept_task.await {
+        warn!(
+            error = %format_args!("{error:#}"),
+            "incoming accept loop failed during shutdown"
+        );
+    }
     for share in registry.values() {
         let _ = set_stopped(&share);
     }
-    endpoint.close().await;
-    accept_task.abort();
-    let _ = accept_task.await;
     info!("synchronization stopped");
     result
 }
@@ -175,12 +195,7 @@ pub async fn attempt_initial_sync(
         SyncHealth::Pending,
         None,
     )?;
-    let endpoint = match Endpoint::builder(presets::N0)
-        .secret_key(identity.secret_key())
-        .alpns(vec![SYNCBOX_ALPN.to_vec()])
-        .bind()
-        .await
-    {
+    let endpoint = match bind_endpoint(identity.secret_key()).await {
         Ok(endpoint) => endpoint,
         Err(error) => {
             warn!(
@@ -258,48 +273,74 @@ fn load_registry(
     })
 }
 
+async fn drain_incoming_handlers(handlers: &mut tokio::task::JoinSet<()>) {
+    while let Some(result) = handlers.join_next().await {
+        if let Err(error) = result {
+            warn!(
+                error = %format_args!("{error:#}"),
+                "incoming synchronization task failed"
+            );
+        }
+    }
+}
+
 fn spawn_accept_loop(endpoint: Endpoint, registry: ShareRegistry) -> JoinHandle<()> {
     tokio::spawn(async move {
         let permits = Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS));
+        let mut handlers = tokio::task::JoinSet::new();
         loop {
-            let Some(incoming) = endpoint.accept().await else {
-                break;
-            };
-            // Drop excess unauthenticated connections rather than allowing stalled peers to
-            // create unbounded tasks or consume every stream handler.
-            let Ok(permit) = permits.clone().try_acquire_owned() else {
-                continue;
-            };
-            let registry = registry.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                let connection = match timeout(HANDSHAKE_TIMEOUT, incoming).await {
-                    Ok(Ok(connection)) => connection,
-                    Ok(Err(error)) => {
+            tokio::select! {
+                biased;
+                Some(result) = handlers.join_next(), if !handlers.is_empty() => {
+                    if let Err(error) = result {
                         warn!(
                             error = %format_args!("{error:#}"),
-                            "incoming connection failed during handshake"
+                            "incoming synchronization task failed"
                         );
-                        return;
                     }
-                    Err(error) => {
-                        warn!(
-                            error = %format_args!("{error:#}"),
-                            "incoming connection handshake timed out"
-                        );
-                        return;
-                    }
-                };
-                let peer_endpoint_id = connection.remote_id();
-                if let Err(error) = handle_incoming(connection, registry).await {
-                    warn!(
-                        peer_endpoint_id = %peer_endpoint_id,
-                        error = %format_args!("{error:#}"),
-                        "incoming synchronization failed"
-                    );
                 }
-            });
+                incoming = endpoint.accept() => {
+                    let Some(incoming) = incoming else {
+                        break;
+                    };
+                    // Drop excess unauthenticated connections rather than allowing stalled peers
+                    // to create unbounded tasks or consume every stream handler.
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        continue;
+                    };
+                    let registry = registry.clone();
+                    handlers.spawn(async move {
+                        let _permit = permit;
+                        let connection = match timeout(HANDSHAKE_TIMEOUT, incoming).await {
+                            Ok(Ok(connection)) => connection,
+                            Ok(Err(error)) => {
+                                warn!(
+                                    error = %format_args!("{error:#}"),
+                                    "incoming connection failed during handshake"
+                                );
+                                return;
+                            }
+                            Err(error) => {
+                                warn!(
+                                    error = %format_args!("{error:#}"),
+                                    "incoming connection handshake timed out"
+                                );
+                                return;
+                            }
+                        };
+                        let peer_endpoint_id = connection.remote_id();
+                        if let Err(error) = handle_incoming(connection, registry).await {
+                            warn!(
+                                peer_endpoint_id = %peer_endpoint_id,
+                                error = %format_args!("{error:#}"),
+                                "incoming synchronization failed"
+                            );
+                        }
+                    });
+                }
+            }
         }
+        drain_incoming_handlers(&mut handlers).await;
     })
 }
 
@@ -308,18 +349,14 @@ async fn run_cycles(endpoint: &Endpoint, registry: &ShareRegistry, once: bool) -
     // Refresh status independently so a healthy process is never reported as stopped merely
     // because one peer is slow or unreachable.
     let heartbeat_task = spawn_heartbeat_loop(registry.clone());
-    let result = tokio::select! {
-        shutdown = wait_for_shutdown_signal() => {
-            shutdown?;
+    let result = if run_sync_cycle_until_shutdown(endpoint, registry).await? {
+        if once {
             Ok(())
+        } else {
+            run_periodic_cycles(endpoint, registry).await
         }
-        () = run_sync_cycle(endpoint, registry) => {
-            if once {
-                Ok(())
-            } else {
-                run_periodic_cycles(endpoint, registry).await
-            }
-        }
+    } else {
+        Ok(())
     };
     heartbeat_task.abort();
     let _ = heartbeat_task.await;
@@ -337,13 +374,28 @@ async fn run_periodic_cycles(endpoint: &Endpoint, registry: &ShareRegistry) -> R
         }
         // A cycle may be waiting for a peer. Keep shutdown responsive instead of postponing a
         // service-manager signal until connection and transfer deadlines expire.
-        tokio::select! {
-            shutdown = wait_for_shutdown_signal() => {
-                shutdown?;
-                return Ok(());
-            }
-            () = run_sync_cycle(endpoint, registry) => {}
+        if !run_sync_cycle_until_shutdown(endpoint, registry).await? {
+            return Ok(());
         }
+    }
+}
+
+async fn run_sync_cycle_until_shutdown(
+    endpoint: &Endpoint,
+    registry: &ShareRegistry,
+) -> Result<bool> {
+    // Keep the cycle future alive after shutdown wins. Its JoinSet owns work that may be inside
+    // block_in_place, which Tokio cannot cancel.
+    let cycle = run_sync_cycle(endpoint, registry);
+    tokio::pin!(cycle);
+    tokio::select! {
+        shutdown = wait_for_shutdown_signal() => {
+            let shutdown_result = shutdown;
+            cycle.await;
+            shutdown_result?;
+            Ok(false)
+        }
+        () = &mut cycle => Ok(true),
     }
 }
 
@@ -382,24 +434,60 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 }
 
 async fn run_sync_cycle(endpoint: &Endpoint, registry: &ShareRegistry) {
+    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_SHARES));
+    let mut tasks = tokio::task::JoinSet::new();
     for share in registry.values() {
-        if let Err(error) = sync_active_share(endpoint, &share).await {
-            error!(
-                share_id = %share.share_id,
-                error = %format_args!("{error:#}"),
-                "synchronization cycle failed"
-            );
+        let permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("share semaphore is never closed");
+        let endpoint = endpoint.clone();
+        tasks.spawn(async move {
+            let _permit = permit;
+            let share_id = share.share_id;
+            let result = sync_active_share(&endpoint, &share).await;
+            (share_id, result)
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((share_id, Err(error))) => {
+                error!(
+                    share_id = %share_id,
+                    error = %format_args!("{error:#}"),
+                    "synchronization cycle failed"
+                );
+            }
+            Ok((_share_id, Ok(()))) => {}
+            Err(error) => {
+                error!(
+                    error = %format_args!("{error:#}"),
+                    "synchronization task failed"
+                );
+            }
         }
+    }
+}
+
+fn run_blocking<T>(operation: impl FnOnce() -> T) -> T {
+    if matches!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread
+    ) {
+        tokio::task::block_in_place(operation)
+    } else {
+        operation()
     }
 }
 
 async fn sync_active_share(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Result<()> {
     let config = share.config()?;
     if config.initial_sync_complete {
-        // Protect only local state changes. Never hold this lock while waiting for a remote
-        // response: two peers can legitimately dial each other at the same time.
+        // Keep the operation lock held while blocking work runs; a detached blocking task could
+        // outlive a cancelled synchronization cycle during shutdown.
         let _operation_lock = share.operation_lock.lock().await;
-        scan_and_save(share, &config)?;
+        run_blocking(|| scan_and_save(share, &config))?;
     }
     sync_known_peers(endpoint, share).await.map(|_| ())
 }
@@ -449,16 +537,37 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
         SyncHealth::Pending,
         None,
     )?;
+    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_PEERS));
+    let mut tasks = tokio::task::JoinSet::new();
+    for peer in candidates {
+        let permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("peer semaphore is never closed");
+        let endpoint = endpoint.clone();
+        let share = Arc::clone(share);
+        tasks.spawn(async move {
+            let _permit = permit;
+            info!(
+                share_id = %share.share_id,
+                peer_endpoint_id = %peer,
+                "starting peer synchronization"
+            );
+            let result = timeout(
+                SYNC_EXCHANGE_TIMEOUT,
+                sync_with_peer(&endpoint, &share, peer),
+            )
+            .await;
+            (peer, result)
+        });
+    }
+
     let mut outcome = SyncOutcome::default();
     let mut had_connection_error = false;
-    for peer in candidates {
-        info!(
-            share_id = %share.share_id,
-            peer_endpoint_id = %peer,
-            "starting peer synchronization"
-        );
-        match timeout(SYNC_EXCHANGE_TIMEOUT, sync_with_peer(endpoint, share, peer)).await {
-            Ok(Ok(peer_outcome)) => {
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((peer, Ok(Ok(peer_outcome)))) => {
                 info!(
                     share_id = %share.share_id,
                     peer_endpoint_id = %peer,
@@ -475,7 +584,7 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
                     .pending_updates
                     .saturating_add(peer_outcome.pending_updates);
             }
-            Ok(Err(error)) => {
+            Ok((peer, Ok(Err(error)))) => {
                 had_connection_error = true;
                 warn!(
                     share_id = %share.share_id,
@@ -485,13 +594,22 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
                 );
                 set_runtime_error(share, "could not connect to a known peer")?;
             }
-            Err(error) => {
+            Ok((peer, Err(error))) => {
                 had_connection_error = true;
                 warn!(
                     share_id = %share.share_id,
                     peer_endpoint_id = %peer,
                     error = %format_args!("{error:#}"),
                     "peer synchronization timed out"
+                );
+                set_runtime_error(share, "could not connect to a known peer")?;
+            }
+            Err(error) => {
+                had_connection_error = true;
+                warn!(
+                    share_id = %share.share_id,
+                    error = %format_args!("{error:#}"),
+                    "peer synchronization task failed"
                 );
                 set_runtime_error(share, "could not connect to a known peer")?;
             }
@@ -596,7 +714,11 @@ async fn sync_with_peer(
     } else {
         Manifest::empty(share.share_id, current_time_ms())
     };
-    let outbound_digest = outbound_manifest.sync_digest(share.share_id)?;
+    let outbound_digest = if config.initial_sync_complete {
+        outbound_manifest.sync_digest_after_validation()
+    } else {
+        outbound_manifest.sync_digest(share.share_id)?
+    };
     let known_peers = known_peer_strings(share, &expected_peer)?;
     write_json_frame(
         &mut send,
@@ -623,7 +745,7 @@ async fn sync_with_peer(
                 updated_config.initial_sync_complete = true;
                 share.paths.save_config(&updated_config)?;
                 share.replace_config(updated_config.clone())?;
-                scan_and_save(share, &updated_config)?;
+                run_blocking(|| scan_and_save(share, &updated_config))?;
             }
         }
         send.finish()
@@ -704,7 +826,9 @@ async fn sync_with_peer(
         let completed =
             receive_download_chunks(share, expected_peer, &final_response.files, &mut recv).await?;
         let _operation_lock = share.operation_lock.lock().await;
-        let applied = apply_remote_staged_transfer(share, &final_response.manifest, &completed)?;
+        let applied = run_blocking(|| {
+            apply_remote_staged_transfer(share, &final_response.manifest, &completed)
+        })?;
         if applied.applied_records > 0 {
             update_runtime(share, |status, now_ms| {
                 status.last_remote_update_at_ms = Some(now_ms);
@@ -719,7 +843,7 @@ async fn sync_with_peer(
             // Only scan after the remote snapshot has been applied. Remote entries retain their
             // version, while files that existed only in the join target receive fresh local
             // versions.
-            scan_and_save(share, &updated_config)?;
+            run_blocking(|| scan_and_save(share, &updated_config))?;
         }
         info!(
             share_id = %share.share_id,
@@ -791,7 +915,7 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
         let known_peers = known_peer_strings(&share, &peer_endpoint_id)?;
         (local_manifest, known_peers)
     };
-    let local_digest = local_manifest.sync_digest(share.share_id)?;
+    let local_digest = local_manifest.sync_digest_after_validation();
     write_json_frame(
         &mut send,
         &SyncResponse {
@@ -869,7 +993,9 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
         )
         .await?;
         let _operation_lock = share.operation_lock.lock().await;
-        let applied = apply_remote_staged_transfer(&share, &remote_message.manifest, &uploaded)?;
+        let applied = run_blocking(|| {
+            apply_remote_staged_transfer(&share, &remote_message.manifest, &uploaded)
+        })?;
         let final_manifest = share.paths.load_manifest(share.share_id)?;
         let files = build_transfer_files(
             &final_manifest,
@@ -986,6 +1112,14 @@ struct ChunkFrame {
     sha256: String,
     offset: u64,
     content: String,
+}
+
+#[derive(Serialize)]
+struct OutgoingChunkFrame<'a> {
+    path: &'a str,
+    sha256: &'a str,
+    offset: u64,
+    content: &'a str,
 }
 
 #[allow(dead_code)]
@@ -1430,6 +1564,8 @@ async fn send_file_chunks_from_root(
     send: &mut SendStream,
 ) -> Result<()> {
     let root = config_root(&share.config()?)?;
+    let mut buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
+    let mut content = String::new();
     for file in files {
         debug!(
             share_id = %share.share_id,
@@ -1448,18 +1584,20 @@ async fn send_file_chunks_from_root(
                 target.display()
             );
         }
-        let mut source = fs::File::open(&target)
+        let mut source = tokio::fs::File::open(&target)
+            .await
             .with_context(|| format!("unable to open shared file {}", target.display()))?;
         source
-            .seek(SeekFrom::Start(file.offset))
+            .seek(std::io::SeekFrom::Start(file.offset))
+            .await
             .with_context(|| format!("unable to seek shared file {}", target.display()))?;
         let mut offset = file.offset;
-        let mut buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
         while offset < file.size {
             let wanted = usize::try_from((file.size - offset).min(buffer.len() as u64))
                 .context("transfer chunk size does not fit this platform")?;
             let count = source
                 .read(&mut buffer[..wanted])
+                .await
                 .with_context(|| format!("unable to read shared file {}", target.display()))?;
             if count == 0 {
                 bail!(
@@ -1467,13 +1605,15 @@ async fn send_file_chunks_from_root(
                     target.display()
                 );
             }
+            content.clear();
+            URL_SAFE_NO_PAD.encode_string(&buffer[..count], &mut content);
             write_json_frame(
                 send,
-                &ChunkFrame {
-                    path: file.path.clone(),
-                    sha256: file.sha256.clone(),
+                &OutgoingChunkFrame {
+                    path: &file.path,
+                    sha256: &file.sha256,
                     offset,
-                    content: URL_SAFE_NO_PAD.encode(&buffer[..count]),
+                    content: &content,
                 },
             )
             .await?;
@@ -1575,6 +1715,8 @@ async fn receive_file_chunks(
 ) -> Result<Vec<CompletedFile>> {
     validate_transfer_file_shapes(files)?;
     let mut completed = Vec::new();
+    let mut data = Vec::with_capacity(TRANSFER_CHUNK_BYTES);
+    let mut canonical = String::new();
     for file in files {
         debug!(
             share_id = %share.share_id,
@@ -1585,10 +1727,12 @@ async fn receive_file_chunks(
             "starting file receive"
         );
         let partial = partial_path(share, &file.path, &file.sha256);
-        let mut destination = ensure_partial_file(&partial, file.offset)
+        let destination = ensure_partial_file(&partial, file.offset)
             .with_context(|| format!("unable to prepare transfer for {}", file.path))?;
+        let mut destination = tokio::fs::File::from_std(destination);
         destination
-            .seek(SeekFrom::Start(file.offset))
+            .seek(std::io::SeekFrom::Start(file.offset))
+            .await
             .with_context(|| format!("unable to seek transfer partial {}", partial.display()))?;
         let mut offset = file.offset;
         while offset < file.size {
@@ -1596,25 +1740,30 @@ async fn receive_file_chunks(
             if frame.path != file.path || frame.sha256 != file.sha256 || frame.offset != offset {
                 bail!("chunk frame does not match the requested transfer");
             }
-            let data = URL_SAFE_NO_PAD
-                .decode(&frame.content)
+            data.clear();
+            URL_SAFE_NO_PAD
+                .decode_vec(&frame.content, &mut data)
                 .map_err(|_| anyhow!("chunk frame payload is not valid base64url"))?;
-            if URL_SAFE_NO_PAD.encode(&data) != frame.content
+            canonical.clear();
+            URL_SAFE_NO_PAD.encode_string(&data, &mut canonical);
+            if canonical != frame.content
                 || data.is_empty()
                 || data.len() > TRANSFER_CHUNK_BYTES
                 || offset.saturating_add(data.len() as u64) > file.size
             {
                 bail!("chunk frame has an invalid payload length");
             }
-            destination.write_all(&data).with_context(|| {
+            destination.write_all(&data).await.with_context(|| {
                 format!("unable to write transfer partial {}", partial.display())
             })?;
             offset += data.len() as u64;
         }
         destination
             .sync_all()
+            .await
             .with_context(|| format!("unable to flush transfer partial {}", partial.display()))?;
-        verify_partial(&partial, file)?;
+        drop(destination);
+        run_blocking(|| verify_partial(&partial, file))?;
         completed.push(CompletedFile {
             file: file.clone(),
             staged_path: partial,
@@ -1914,8 +2063,12 @@ fn scan_and_save(share: &Arc<ActiveShare>, config: &ShareConfig) -> Result<()> {
     } else {
         debug!(share_id = %share.share_id, "local scan found no changes");
     }
-    share.paths.save_clock(share.share_id, &scanned.clock)?;
-    share.paths.save_manifest(&scanned.manifest)?;
+    if scanned.changes > 0 {
+        share.paths.save_clock(share.share_id, &scanned.clock)?;
+    }
+    if scanned.manifest_changed {
+        share.paths.save_manifest(&scanned.manifest)?;
+    }
     update_runtime(share, |status, _| {
         status.last_scan_at_ms = Some(now_ms);
         if scanned.changes > 0 {
@@ -2938,7 +3091,10 @@ mod tests {
     #[cfg(unix)]
     use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 
-    use iroh::SecretKey;
+    use iroh::{
+        SecretKey, TransportAddr,
+        address_lookup::{AddrFilter, EndpointData},
+    };
     #[cfg(unix)]
     use tempfile::TempDir;
 
@@ -2951,6 +3107,42 @@ mod tests {
         },
         types::{ClockState, HlcTimestamp, KnownPeers, RuntimeStatus},
     };
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_falls_back_without_panicking() {
+        assert_eq!(run_blocking(|| 42), 42);
+    }
+
+    #[test]
+    fn unfiltered_pkarr_candidates_keep_direct_addresses() {
+        let data = EndpointData::from_iter([
+            TransportAddr::Ip("192.0.2.1:443".parse().unwrap()),
+            TransportAddr::Relay("https://relay.example.com".parse().unwrap()),
+        ]);
+        assert_eq!(
+            data.apply_filter(&AddrFilter::unfiltered()).addrs().count(),
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incoming_handlers_are_drained_before_shutdown() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut handlers = tokio::task::JoinSet::new();
+        handlers.spawn(async move {
+            let _ = release_rx.await;
+        });
+
+        let mut drain = Box::pin(drain_incoming_handlers(&mut handlers));
+        assert!(
+            timeout(Duration::from_millis(10), &mut drain)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        drain.await;
+        assert!(handlers.is_empty());
+    }
 
     fn config() -> (ShareConfig, EndpointId, EndpointId) {
         let client = SecretKey::from_bytes(&[1; 32]).public();

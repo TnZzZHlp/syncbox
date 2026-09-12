@@ -9,7 +9,7 @@ Syncbox is a Rust command-line application for synchronizing multiple independen
 - Binary, versioned `syncbox1:` ShareTickets with strict validation and checksums.
 - Persistent application state in the operating system data directory, never in the shared directory.
 - Runtime status with heartbeat, lock, PID, and stale-process detection.
-- Direct or relayed QUIC transport through Iroh.
+- Unfiltered direct QUIC candidates through Iroh N0 discovery, with port mapping, default best-path selection, and no relay fallback.
 - On Unix, POSIX permission bits for regular files and subdirectories are synchronized. Ownership,
   ACLs, extended attributes, and the selected shared-root directory's own mode remain local.
 

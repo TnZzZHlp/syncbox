@@ -1,6 +1,6 @@
 [package]
 name = "syncbox"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 description = "Multi-share peer-to-peer file synchronization"
 license = "MIT OR Apache-2.0"
@@ -16,14 +16,14 @@ directories-next = "2.0"
 fs4 = "1.1"
 hex = "0.4"
 hmac = "0.12"
-iroh = "=1.0.3"
+iroh = "=1.2.0"
 rand = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 subtle = "2.6"
 thiserror = "2.0"
-tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+tokio = { version = "1.49", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "time", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2.5"

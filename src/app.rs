@@ -264,8 +264,12 @@ impl App {
         let clock = self.paths.load_clock(share_id)?;
         let now_ms = current_time_ms();
         let scanned = scan_manifest(&root, &manifest, clock, &identity.endpoint_id(), now_ms)?;
-        self.paths.save_clock(share_id, &scanned.clock)?;
-        self.paths.save_manifest(&scanned.manifest)?;
+        if scanned.changes > 0 {
+            self.paths.save_clock(share_id, &scanned.clock)?;
+        }
+        if scanned.manifest_changed {
+            self.paths.save_manifest(&scanned.manifest)?;
+        }
 
         let mut runtime = self
             .paths
@@ -364,7 +368,7 @@ impl App {
             let output = ShareStatus {
                 share_id: share_id.to_string(),
                 name: config.name.clone(),
-                local_directory: config.local_directory.clone(),
+                local_directory: config.local_directory,
                 endpoint_id: endpoint_id.clone().unwrap_or_default(),
                 runtime: assessment.runtime.as_str().to_owned(),
                 health: stored.health.as_str().to_owned(),
@@ -382,7 +386,7 @@ impl App {
                 last_remote_update: format_timestamp(stored.last_remote_update_at_ms),
                 last_successful_sync: format_timestamp(stored.last_sync_at_ms),
                 last_connection: format_timestamp(stored.last_connection_at_ms),
-                last_error: stored.last_error.clone(),
+                last_error: stored.last_error,
             };
             details.push(StatusDetails {
                 heartbeat_stale: assessment.heartbeat_stale,
