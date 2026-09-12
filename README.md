@@ -83,7 +83,7 @@ CROSS_CONTAINER_ENGINE=podman cross build --release --target x86_64-pc-windows-g
 
 ## Current transfer limits
 
-The current protocol transfers up to 16 MiB per file, 64 MiB per exchange, and 256 files per exchange. Larger files remain pending rather than being falsely reported as synchronized.
+The current protocol streams file contents in 1 MiB chunks and no longer imposes the former 16 MiB per-file or 64 MiB per-exchange limits. Each exchange handles up to 256 files, with additional files left pending, and control frames are capped at 96 MiB.
 
 ## License
 
