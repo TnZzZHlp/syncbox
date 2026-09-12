@@ -49,9 +49,12 @@ syncbox status
 syncbox status --json
 syncbox scan SHARE_ID
 syncbox ticket SHARE_ID
+syncbox remove SHARE_ID
 ```
 
 `syncbox ticket` reprints an existing share credential. A ShareTicket is a bearer credential: anyone who obtains the complete ticket can join that share. Do not put tickets in logs or public issue reports.
+
+`syncbox remove` unregisters the share only on the current device and leaves its local directory and files unchanged. Stop any running Syncbox service first. Removing a share does not revoke existing ShareTickets or affect other devices, and the share can be joined again later with a valid ticket.
 
 ## State layout
 

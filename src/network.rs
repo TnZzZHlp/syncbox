@@ -172,22 +172,33 @@ pub async fn run(
     result
 }
 
+/// Result of the initial synchronization attempt performed by `join`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialSyncStatus {
+    Complete,
+    Pending,
+    Offline,
+}
+
 /// Attempts the mandatory initial peer connection after `join` has already persisted its state.
-/// Connection failures are normal: callers receive `Ok(false)` and retain the ticket data.
+///
+/// The registry lock keeps removal from racing this handoff. Peer-level connection failures are
+/// normal and return `Offline`; state and lifecycle errors propagate to the caller.
 pub async fn attempt_initial_sync(
     paths: DataPaths,
     identity: DeviceIdentity,
     share_id: ShareId,
-) -> Result<bool> {
+) -> Result<InitialSyncStatus> {
+    let _registry_lock = paths.acquire_registry_lock()?;
     let Some(_device_lock) = paths.try_acquire_device_run_lock()? else {
-        return Ok(false);
+        return Ok(InitialSyncStatus::Offline);
     };
     let Some(_share_lock) = paths.try_acquire_share_lock(share_id)? else {
-        return Ok(false);
+        return Ok(InitialSyncStatus::Offline);
     };
     let registry = load_registry(&paths, identity.endpoint_id(), &[share_id])?;
     let Some(share) = registry.get(share_id) else {
-        return Ok(false);
+        return Ok(InitialSyncStatus::Offline);
     };
     set_runtime_state(
         &share,
@@ -203,48 +214,63 @@ pub async fn attempt_initial_sync(
                 error = %format_args!("{error:#}"),
                 "unable to start Iroh endpoint for initial sync"
             );
-            set_runtime_state(
+            return Err(cleanup_initial_sync_error(
                 &share,
-                RuntimeState::WaitingForPeers,
-                SyncHealth::Offline,
-                None,
-            )?;
-            return Ok(false);
+                anyhow::Error::new(error).context("unable to start Iroh endpoint for initial sync"),
+            ));
         }
     };
     let result = sync_known_peers(&endpoint, &share).await;
     endpoint.close().await;
-    match result {
-        Ok(outcome) if outcome.connected => {
-            info!(share_id = %share_id, "initial synchronization connected");
-            set_stopped(&share)?;
-            Ok(true)
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => return Err(cleanup_initial_sync_error(&share, error)),
+    };
+    if outcome.connected {
+        let status = initial_sync_status(&outcome);
+        match status {
+            InitialSyncStatus::Complete => {
+                info!(share_id = %share_id, "initial synchronization completed");
+            }
+            InitialSyncStatus::Pending => {
+                info!(
+                    share_id = %share_id,
+                    pending_downloads = outcome.pending_downloads,
+                    pending_updates = outcome.pending_updates,
+                    "initial synchronization remains pending"
+                );
+            }
+            InitialSyncStatus::Offline => unreachable!("connected outcome cannot be offline"),
         }
-        Ok(_) => {
-            info!(share_id = %share_id, "initial synchronization found no online peers");
-            set_runtime_state(
-                &share,
-                RuntimeState::WaitingForPeers,
-                SyncHealth::Offline,
-                None,
-            )?;
-            Ok(false)
-        }
-        Err(error) => {
-            warn!(
-                share_id = %share_id,
-                error = %format_args!("{error:#}"),
-                "initial synchronization failed"
-            );
-            set_runtime_state(
-                &share,
-                RuntimeState::WaitingForPeers,
-                SyncHealth::Offline,
-                None,
-            )?;
-            Ok(false)
-        }
+        set_stopped(&share)?;
+        return Ok(status);
     }
+
+    info!(share_id = %share_id, "initial synchronization found no online peers");
+    set_runtime_state(
+        &share,
+        RuntimeState::WaitingForPeers,
+        SyncHealth::Offline,
+        None,
+    )?;
+    set_stopped(&share)?;
+    Ok(InitialSyncStatus::Offline)
+}
+
+fn cleanup_initial_sync_error(share: &Arc<ActiveShare>, error: anyhow::Error) -> anyhow::Error {
+    let cleanup = set_runtime_state(
+        share,
+        RuntimeState::WaitingForPeers,
+        SyncHealth::Offline,
+        Some("initial synchronization failed"),
+    )
+    .and_then(|()| set_stopped(share));
+    if let Err(cleanup_error) = cleanup {
+        return error.context(format!(
+            "initial synchronization failed; unable to reset runtime state: {cleanup_error:#}"
+        ));
+    }
+    error.context("initial synchronization failed")
 }
 
 fn load_registry(
@@ -498,6 +524,16 @@ struct SyncOutcome {
     connected_peers: usize,
     pending_downloads: usize,
     pending_updates: usize,
+}
+
+const fn initial_sync_status(outcome: &SyncOutcome) -> InitialSyncStatus {
+    if !outcome.connected {
+        InitialSyncStatus::Offline
+    } else if outcome.pending_downloads == 0 && outcome.pending_updates == 0 {
+        InitialSyncStatus::Complete
+    } else {
+        InitialSyncStatus::Pending
+    }
 }
 
 struct PeerSyncOutcome {
@@ -3122,6 +3158,33 @@ mod tests {
         assert_eq!(
             data.apply_filter(&AddrFilter::unfiltered()).addrs().count(),
             2
+        );
+    }
+
+    #[test]
+    fn initial_sync_status_distinguishes_pending_work() {
+        assert_eq!(
+            initial_sync_status(&SyncOutcome {
+                connected: true,
+                ..SyncOutcome::default()
+            }),
+            InitialSyncStatus::Complete
+        );
+        assert_eq!(
+            initial_sync_status(&SyncOutcome {
+                connected: true,
+                pending_downloads: 1,
+                ..SyncOutcome::default()
+            }),
+            InitialSyncStatus::Pending
+        );
+        assert_eq!(
+            initial_sync_status(&SyncOutcome {
+                connected: false,
+                pending_updates: 1,
+                ..SyncOutcome::default()
+            }),
+            InitialSyncStatus::Offline
         );
     }
 

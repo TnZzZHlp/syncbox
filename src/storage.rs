@@ -183,6 +183,55 @@ impl DataPaths {
         write_result
     }
 
+    /// Atomically unregisters a share before removing its private state directory.
+    /// The caller must hold the registry and share locks for `share_id`.
+    pub fn remove_share_state(&self, share_id: ShareId) -> Result<()> {
+        let shares = self.shares_dir();
+        for (path, description) in [
+            (self.root.as_path(), "Syncbox data root"),
+            (shares.as_path(), "registered shares path"),
+        ] {
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("unable to inspect {description} {}", path.display()))?;
+            if !metadata.file_type().is_dir() {
+                bail!("{description} {} is not a directory", path.display());
+            }
+        }
+
+        let target = shares.join(share_id.to_string());
+        let metadata = fs::symlink_metadata(&target).with_context(|| {
+            format!(
+                "unable to inspect registered share directory {}",
+                target.display()
+            )
+        })?;
+        if !metadata.file_type().is_dir() {
+            bail!(
+                "registered share path {} is not a directory",
+                target.display()
+            );
+        }
+
+        let removed = shares.join(format!(
+            ".{}-{}-{}.removed",
+            share_id,
+            std::process::id(),
+            rand::rng().random::<u64>()
+        ));
+        fs::rename(&target, &removed).with_context(|| {
+            format!("unable to unregister share directory {}", target.display())
+        })?;
+        sync_parent_directory(&self.shares_dir())?;
+        fs::remove_dir_all(&removed).with_context(|| {
+            format!(
+                "unable to remove unregistered share state {}",
+                removed.display()
+            )
+        })?;
+        sync_parent_directory(&self.shares_dir())?;
+        Ok(())
+    }
+
     pub fn acquire_registry_lock(&self) -> Result<File> {
         self.ensure_layout()?;
         acquire_lock(&self.registry_lock())
@@ -630,6 +679,79 @@ mod tests {
         assert_eq!(
             paths.list_share_ids().unwrap(),
             Vec::<crate::types::ShareId>::new()
+        );
+    }
+
+    #[test]
+    fn removing_share_state_preserves_other_directories() {
+        let temporary = TempDir::new().unwrap();
+        let paths = DataPaths::from_root(temporary.path().join("data"));
+        let share_id = ShareId::random();
+        let other_share_id = ShareId::random();
+        let shared_directory = temporary.path().join("shared");
+        fs::create_dir(&shared_directory).unwrap();
+        fs::write(shared_directory.join("keep.txt"), "keep").unwrap();
+        paths.ensure_share_layout(share_id).unwrap();
+        paths.ensure_share_layout(other_share_id).unwrap();
+        fs::write(paths.share_config(share_id), "private state").unwrap();
+
+        paths.remove_share_state(share_id).unwrap();
+
+        assert!(!paths.share_dir(share_id).exists());
+        assert!(paths.share_dir(other_share_id).is_dir());
+        assert_eq!(
+            fs::read_to_string(shared_directory.join("keep.txt")).unwrap(),
+            "keep"
+        );
+        assert_eq!(paths.list_share_ids().unwrap(), vec![other_share_id]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_share_state_rejects_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDir::new().unwrap();
+        let paths = DataPaths::from_root(temporary.path().join("data"));
+        let share_id = ShareId::random();
+        let outside = temporary.path().join("outside");
+        paths.ensure_layout().unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), "keep").unwrap();
+        symlink(&outside, paths.share_dir(share_id)).unwrap();
+
+        let error = paths.remove_share_state(share_id).unwrap_err().to_string();
+
+        assert!(error.contains("is not a directory"));
+        assert_eq!(
+            fs::read_to_string(outside.join("keep.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_share_state_rejects_a_symlinked_shares_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDir::new().unwrap();
+        let data_root = temporary.path().join("data");
+        let outside = temporary.path().join("outside");
+        let paths = DataPaths::from_root(data_root.clone());
+        let share_id = ShareId::random();
+        fs::create_dir_all(&data_root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(outside.join(share_id.to_string())).unwrap();
+        fs::write(outside.join(share_id.to_string()).join("keep.txt"), "keep").unwrap();
+        symlink(&outside, data_root.join("shares")).unwrap();
+
+        let error = paths.remove_share_state(share_id).unwrap_err().to_string();
+
+        assert!(error.contains("registered shares path"));
+        assert!(outside.join(share_id.to_string()).is_dir());
+        assert_eq!(
+            fs::read_to_string(outside.join(share_id.to_string()).join("keep.txt")).unwrap(),
+            "keep"
         );
     }
 }

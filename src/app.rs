@@ -192,7 +192,7 @@ impl App {
             local_directory,
             endpoint_id,
             initial_peers: ticket.initial_peers,
-            initial_peer_online: false,
+            initial_sync_status: network::InitialSyncStatus::Offline,
         })
     }
 
@@ -200,15 +200,15 @@ impl App {
         let mut result = self.register_join(ticket_text, requested_directory)?;
         let identity = identity::load_or_create(&self.paths)?;
         // An unavailable peer is an expected join state. The durable registration made above is
-        // retained and run will continue retrying without requiring the ticket again.
-        result.initial_peer_online =
-            network::attempt_initial_sync(self.paths.clone(), identity, result.share_id)
-                .await
-                .unwrap_or(false);
+        // retained and run will continue retrying without requiring the ticket again. State and
+        // lifecycle errors propagate so a removed registration is never reported as successful.
+        result.initial_sync_status =
+            network::attempt_initial_sync(self.paths.clone(), identity, result.share_id).await?;
         Ok(result)
     }
 
     pub async fn run(&self, selector: Option<&str>, once: bool) -> Result<RunCommandResult> {
+        let registry_lock = self.paths.acquire_registry_lock()?;
         let share_ids = match selector {
             Some(selector) => vec![self.resolve_share_selector(selector)?],
             None => self.paths.list_share_ids()?,
@@ -232,6 +232,7 @@ impl App {
             };
             share_locks.push(lock);
         }
+        drop(registry_lock);
         let identity = identity::load_or_create(&self.paths)?;
         network::run(
             self.paths.clone(),
@@ -244,6 +245,26 @@ impl App {
         Ok(RunCommandResult {
             shares_started: ordered_share_ids.len(),
         })
+    }
+
+    pub fn remove(&self, selector: &str) -> Result<RemoveCommandResult> {
+        let _registry_lock = self.paths.acquire_registry_lock()?;
+        let share_id = self.resolve_share_selector(selector)?;
+        let Some(_share_lock) = self.paths.try_acquire_share_lock(share_id)? else {
+            bail!(
+                "share {share_id} is currently in use by another Syncbox process; stop it before removing the share"
+            );
+        };
+
+        if selector != share_id.to_string()
+            && let Err(error) = self.validate_share_state(share_id)
+        {
+            bail!(
+                "share {share_id} has incomplete or invalid local state; use its full 64-character Share ID to remove it: {error:#}"
+            );
+        }
+        self.paths.remove_share_state(share_id)?;
+        Ok(RemoveCommandResult { share_id })
     }
 
     pub fn scan(&self, selector: &str) -> Result<ScanCommandResult> {
@@ -320,6 +341,15 @@ impl App {
 
     pub fn all_share_ids(&self) -> Result<Vec<ShareId>> {
         self.paths.list_share_ids()
+    }
+
+    fn validate_share_state(&self, share_id: ShareId) -> Result<()> {
+        self.paths.load_config(share_id)?;
+        self.paths.load_manifest(share_id)?;
+        self.paths.load_clock(share_id)?;
+        self.paths.load_known_peers(share_id)?;
+        self.paths.load_runtime_status(share_id)?;
+        Ok(())
     }
 
     pub fn resolve_share_selector(&self, selector: &str) -> Result<ShareId> {
@@ -502,12 +532,17 @@ pub struct JoinResult {
     pub local_directory: PathBuf,
     pub endpoint_id: EndpointId,
     pub initial_peers: Vec<EndpointId>,
-    pub initial_peer_online: bool,
+    pub initial_sync_status: network::InitialSyncStatus,
 }
 
 #[derive(Clone, Debug)]
 pub struct RunCommandResult {
     pub shares_started: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoveCommandResult {
+    pub share_id: ShareId,
 }
 
 #[derive(Clone, Debug)]
@@ -796,6 +831,75 @@ mod tests {
         assert!(app.paths().share_clock(result.share_id).exists());
         assert!(app.paths().share_known_peers(result.share_id).exists());
         assert!(app.paths().share_runtime_status(result.share_id).exists());
+    }
+
+    #[test]
+    fn remove_unregisters_share_without_deleting_local_files() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("keep.txt"), "keep").unwrap();
+        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
+        let result = app.init(&root, None).unwrap();
+        let share_id = result.share_id.to_string();
+
+        let removed = app.remove(&share_id[..8]).unwrap();
+
+        assert_eq!(removed.share_id, result.share_id);
+        assert!(!app.paths().share_dir(result.share_id).exists());
+        assert_eq!(fs::read_to_string(root.join("keep.txt")).unwrap(), "keep");
+        assert_eq!(app.all_share_ids().unwrap(), Vec::<ShareId>::new());
+    }
+
+    #[test]
+    fn remove_requires_full_id_for_invalid_state() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
+        let result = app.init(&root, None).unwrap();
+        let share_id = result.share_id.to_string();
+        fs::write(app.paths().share_manifest(result.share_id), "invalid").unwrap();
+
+        let error = app.remove(&share_id[..8]).unwrap_err().to_string();
+        assert!(error.contains("use its full 64-character Share ID"));
+        assert!(app.paths().share_dir(result.share_id).is_dir());
+
+        app.remove(&share_id).unwrap();
+        assert!(!app.paths().share_dir(result.share_id).exists());
+        assert!(root.is_dir());
+    }
+
+    #[test]
+    fn remove_rejects_a_share_that_is_in_use() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
+        let result = app.init(&root, None).unwrap();
+        let _lock = app.paths().acquire_share_lock(result.share_id).unwrap();
+
+        let error = app.remove(&result.share_id.to_string()).unwrap_err();
+
+        assert!(error.to_string().contains("currently in use"));
+        assert!(app.paths().share_dir(result.share_id).is_dir());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initial_sync_propagates_removed_share_state_errors() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
+        let result = app.init(&root, None).unwrap();
+        let identity = identity::load_or_create(app.paths()).unwrap();
+        app.paths().remove_share_state(result.share_id).unwrap();
+
+        let error = network::attempt_initial_sync(app.paths().clone(), identity, result.share_id)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unable to inspect"));
     }
 
     #[test]

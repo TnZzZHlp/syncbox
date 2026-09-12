@@ -2,7 +2,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use syncbox::app::App;
+use syncbox::{app::App, network::InitialSyncStatus};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -35,6 +35,8 @@ enum Command {
         #[arg(long, hide = true)]
         once: bool,
     },
+    /// Remove a local share registration without deleting synchronized files.
+    Remove { share_id: String },
     /// Show local state without starting a synchronization engine or connecting to the network.
     Status {
         share_id: Option<String>,
@@ -100,11 +102,16 @@ async fn run() -> Result<()> {
             println!("Share ID: {}", result.share_id);
             println!("Local directory: {}", result.local_directory.display());
             println!("Endpoint ID: {}", result.endpoint_id);
-            if result.initial_peer_online {
-                println!("\nInitial synchronization completed");
-            } else {
-                println!("\nNo known peer is currently online");
-                println!("Run `syncbox run` to keep retrying automatically");
+            match result.initial_sync_status {
+                InitialSyncStatus::Complete => println!("\nInitial synchronization completed"),
+                InitialSyncStatus::Pending => {
+                    println!("\nInitial synchronization is pending");
+                    println!("Run `syncbox run` to continue synchronization");
+                }
+                InitialSyncStatus::Offline => {
+                    println!("\nNo known peer is currently online");
+                    println!("Run `syncbox run` to keep retrying automatically");
+                }
             }
         }
         Command::Run { share_id, once } => {
@@ -112,6 +119,12 @@ async fn run() -> Result<()> {
             if result.shares_started == 0 {
                 println!("No shared directories registered");
             }
+        }
+        Command::Remove { share_id } => {
+            let result = app.remove(&share_id)?;
+            println!("Shared directory registration removed");
+            println!("Share ID: {}", result.share_id);
+            println!("Local directory and files were left unchanged");
         }
         Command::Status { share_id, json } => {
             let report = app.status(share_id.as_deref())?;

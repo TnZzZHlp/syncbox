@@ -54,6 +54,58 @@ fn init_and_status_keep_state_outside_the_shared_directory() {
 }
 
 #[test]
+fn remove_unregisters_share_and_preserves_local_files() {
+    let temporary = TempDir::new().unwrap();
+    let shared_directory = temporary.path().join("shared");
+    let data_directory = temporary.path().join("data");
+    fs::create_dir_all(&shared_directory).unwrap();
+    fs::write(shared_directory.join("keep.txt"), "keep").unwrap();
+    syncbox()
+        .env("SYNCBOX_DATA_DIR", &data_directory)
+        .args(["init", shared_directory.to_str().unwrap()])
+        .assert()
+        .success();
+    let status = syncbox()
+        .env("SYNCBOX_DATA_DIR", &data_directory)
+        .args(["status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status).unwrap();
+    let share_id = status["shares"][0]["share_id"].as_str().unwrap();
+
+    let output = syncbox()
+        .env("SYNCBOX_DATA_DIR", &data_directory)
+        .args(["remove", &share_id[..8]])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("Shared directory registration removed"));
+    assert!(output.contains("Local directory and files were left unchanged"));
+    assert_eq!(
+        fs::read_to_string(shared_directory.join("keep.txt")).unwrap(),
+        "keep"
+    );
+    assert!(!data_directory.join("shares").join(share_id).exists());
+    let status = syncbox()
+        .env("SYNCBOX_DATA_DIR", &data_directory)
+        .args(["status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status).unwrap();
+    assert_eq!(status, serde_json::json!({ "shares": [] }));
+}
+
+#[test]
 fn status_on_an_empty_data_directory_is_machine_readable() {
     let temporary = TempDir::new().unwrap();
     let data_directory = temporary.path().join("data");
