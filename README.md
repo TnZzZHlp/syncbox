@@ -12,6 +12,9 @@ Syncbox is a Rust command-line application for synchronizing multiple independen
 - Unfiltered direct QUIC candidates through Iroh N0 discovery, with port mapping, default best-path selection, and no relay fallback.
 - On Unix, POSIX permission bits for regular files and subdirectories are synchronized. Ownership,
   ACLs, extended attributes, and the selected shared-root directory's own mode remain local.
+- Symbolic links are synchronized as links on Unix and never followed while scanning. Following
+  Syncthing's cross-platform policy, Windows does not create or publish symbolic links: remote links
+  are retained as unsupported state, reported by `syncbox status`, and do not block unrelated files.
 
 ## Upgrades
 

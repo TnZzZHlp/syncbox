@@ -57,6 +57,7 @@ const MAX_CONCURRENT_SHARES: usize = 4;
 const MAX_CONCURRENT_PEERS: usize = 2;
 const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+const WINDOWS_SYMLINK_ERROR: &str = "symbolic links are unsupported on Windows";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -524,12 +525,16 @@ struct SyncOutcome {
     connected_peers: usize,
     pending_downloads: usize,
     pending_updates: usize,
+    unsupported_items: usize,
 }
 
 const fn initial_sync_status(outcome: &SyncOutcome) -> InitialSyncStatus {
     if !outcome.connected {
         InitialSyncStatus::Offline
-    } else if outcome.pending_downloads == 0 && outcome.pending_updates == 0 {
+    } else if outcome.pending_downloads == 0
+        && outcome.pending_updates == 0
+        && outcome.unsupported_items == 0
+    {
         InitialSyncStatus::Complete
     } else {
         InitialSyncStatus::Pending
@@ -544,6 +549,17 @@ struct PeerSyncOutcome {
 struct ApplyOutcome {
     pending_downloads: usize,
     applied_records: usize,
+    unsupported_items: usize,
+}
+
+#[cfg(windows)]
+fn unsupported_symlink_count(manifest: &Manifest) -> usize {
+    manifest.symlinks.len()
+}
+
+#[cfg(not(windows))]
+const fn unsupported_symlink_count(_manifest: &Manifest) -> usize {
+    0
 }
 
 async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Result<SyncOutcome> {
@@ -651,18 +667,18 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
             }
         }
     }
+    outcome.unsupported_items =
+        unsupported_symlink_count(&share.paths.load_manifest(share.share_id)?);
     if outcome.connected {
-        let completely_synchronized =
-            outcome.pending_downloads == 0 && outcome.pending_updates == 0;
-        let health = if completely_synchronized {
-            SyncHealth::Synchronized
+        let completely_synchronized = outcome.pending_downloads == 0
+            && outcome.pending_updates == 0
+            && outcome.unsupported_items == 0;
+        let (state, health) = if outcome.unsupported_items > 0 {
+            (RuntimeState::Degraded, SyncHealth::Error)
+        } else if completely_synchronized {
+            (RuntimeState::Running, SyncHealth::Synchronized)
         } else {
-            SyncHealth::Pending
-        };
-        let state = if completely_synchronized {
-            RuntimeState::Running
-        } else {
-            RuntimeState::Synchronizing
+            (RuntimeState::Synchronizing, SyncHealth::Pending)
         };
         update_runtime(share, |status, now_ms| {
             status.state = state;
@@ -671,7 +687,8 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
             status.pending_downloads = outcome.pending_downloads;
             status.pending_updates = outcome.pending_updates;
             status.last_sync_at_ms = Some(now_ms);
-            status.last_error = None;
+            status.last_error =
+                (outcome.unsupported_items > 0).then(|| WINDOWS_SYMLINK_ERROR.to_owned());
         })?;
     } else {
         set_runtime_state(
@@ -686,6 +703,7 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
         connected_peers = outcome.connected_peers,
         pending_downloads = outcome.pending_downloads,
         pending_updates = outcome.pending_updates,
+        unsupported_items = outcome.unsupported_items,
         "synchronization with known peers finished"
     );
     Ok(outcome)
@@ -886,6 +904,7 @@ async fn sync_with_peer(
             peer_endpoint_id = %expected_peer,
             applied_records = applied.applied_records,
             pending_downloads = applied.pending_downloads,
+            unsupported_items = applied.unsupported_items,
             "applied peer transfer"
         );
         applied
@@ -967,9 +986,15 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
         send.finish()
             .context("unable to finish unchanged sync stream")?;
         let _ = timeout(Duration::from_secs(5), send.stopped()).await;
+        let unsupported_items = unsupported_symlink_count(&local_manifest);
         update_runtime(&share, |status, now_ms| {
             status.last_connection_at_ms = Some(now_ms);
             status.pending_downloads = 0;
+            if unsupported_items > 0 {
+                status.state = RuntimeState::Degraded;
+                status.health = SyncHealth::Error;
+                status.last_error = Some(WINDOWS_SYMLINK_ERROR.to_owned());
+            }
         })?;
         info!(
             share_id = %share.share_id,
@@ -1043,6 +1068,7 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
             peer_endpoint_id = %peer_endpoint_id,
             applied_records = applied.applied_records,
             pending_downloads = applied.pending_downloads,
+            unsupported_items = applied.unsupported_items,
             response_files = files.len(),
             "applied incoming peer transfer"
         );
@@ -1070,6 +1096,11 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
             status.last_remote_update_at_ms = Some(now_ms);
         }
         status.pending_downloads = applied.pending_downloads;
+        if applied.unsupported_items > 0 {
+            status.state = RuntimeState::Degraded;
+            status.health = SyncHealth::Error;
+            status.last_error = Some(WINDOWS_SYMLINK_ERROR.to_owned());
+        }
     })?;
     info!(
         share_id = %share.share_id,
@@ -2039,15 +2070,18 @@ fn apply_remote_transfer_impl(
         observe_manifest_clock(share, &candidate)?;
         share.paths.save_manifest(&candidate)?;
     }
+    let unsupported_items = unsupported_symlink_count(&candidate);
     debug!(
         share_id = %share.share_id,
         applied_records,
         pending_downloads,
+        unsupported_items,
         "remote transfer apply finished"
     );
     Ok(ApplyOutcome {
         pending_downloads,
         applied_records,
+        unsupported_items,
     })
 }
 
@@ -2469,7 +2503,20 @@ fn write_local_symlink(
             result
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _ = target;
+        warn!(
+            share_id = %share.share_id,
+            path = manifest_path,
+            "recording remote symbolic link as unsupported on Windows"
+        );
+        // Match Syncthing: keep the remote link in local index state without creating a marker.
+        // Removing a conflicting leaf is safe because remove_local_path never follows links and
+        // refuses to remove non-empty directories.
+        remove_local_path(root, manifest_path)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (share, root, manifest_path, target);
         bail!("symbolic links are not supported on this platform")
@@ -3124,24 +3171,20 @@ async fn read_json_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T
 mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
-    #[cfg(unix)]
     use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 
     use iroh::{
         SecretKey, TransportAddr,
         address_lookup::{AddrFilter, EndpointData},
     };
-    #[cfg(unix)]
     use tempfile::TempDir;
 
     use super::*;
-    use crate::types::{FORMAT_VERSION, ShareSecret};
     #[cfg(unix)]
+    use crate::manifest::{DirectoryEntry, Tombstone};
     use crate::{
-        manifest::{
-            DirectoryEntry, MANIFEST_FORMAT_VERSION, ManifestEntry, SymlinkEntry, Tombstone,
-        },
-        types::{ClockState, HlcTimestamp, KnownPeers, RuntimeStatus},
+        manifest::{MANIFEST_FORMAT_VERSION, ManifestEntry, SymlinkEntry},
+        types::{ClockState, FORMAT_VERSION, HlcTimestamp, KnownPeers, RuntimeStatus, ShareSecret},
     };
 
     #[tokio::test(flavor = "current_thread")]
@@ -3174,6 +3217,14 @@ mod tests {
             initial_sync_status(&SyncOutcome {
                 connected: true,
                 pending_downloads: 1,
+                ..SyncOutcome::default()
+            }),
+            InitialSyncStatus::Pending
+        );
+        assert_eq!(
+            initial_sync_status(&SyncOutcome {
+                connected: true,
+                unsupported_items: 1,
                 ..SyncOutcome::default()
             }),
             InitialSyncStatus::Pending
@@ -3334,7 +3385,6 @@ mod tests {
         validate_transfer_files(&[file], &manifest).unwrap();
     }
 
-    #[cfg(unix)]
     #[allow(clippy::needless_pass_by_value)]
     fn active_share(root: &Path, manifest: Manifest, endpoint: EndpointId) -> Arc<ActiveShare> {
         let paths = DataPaths::from_root(root.parent().unwrap().join("state"));
@@ -3368,13 +3418,73 @@ mod tests {
         })
     }
 
-    #[cfg(unix)]
     fn timestamp(wall_ms: u64, endpoint: EndpointId) -> HlcTimestamp {
         HlcTimestamp {
             wall_ms,
             counter: 0,
             author: *endpoint.as_bytes(),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retains_remote_symlink_as_unsupported_without_blocking_files() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+        let share_id = ShareId([43; 32]);
+        let local_endpoint = SecretKey::from_bytes(&[44; 32]).public();
+        let remote_endpoint = SecretKey::from_bytes(&[45; 32]).public();
+        let share = active_share(&root, Manifest::empty(share_id, 0), local_endpoint);
+        let bytes = b"content";
+        let remote = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 1,
+            entries: BTreeMap::from([(
+                "file.txt".to_owned(),
+                ManifestEntry {
+                    size: bytes.len() as u64,
+                    modified_at_ns: 0,
+                    sha256: hex::encode(Sha256::digest(bytes)),
+                    permissions: None,
+                    version: timestamp(1, remote_endpoint),
+                },
+            )]),
+            directories: BTreeMap::new(),
+            symlinks: BTreeMap::from([(
+                "alias.txt".to_owned(),
+                SymlinkEntry {
+                    target: "file.txt".to_owned(),
+                    version: timestamp(2, remote_endpoint),
+                },
+            )]),
+            tombstones: BTreeMap::new(),
+        };
+        let files = vec![FilePayload {
+            path: "file.txt".to_owned(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+            content: URL_SAFE_NO_PAD.encode(bytes),
+        }];
+
+        let outcome = apply_remote_transfer(&share, &remote, &files).unwrap();
+
+        assert_eq!(outcome.pending_downloads, 0);
+        assert_eq!(outcome.unsupported_items, 1);
+        assert_eq!(fs::read(root.join("file.txt")).unwrap(), bytes);
+        assert!(!root.join("alias.txt").exists());
+        let stored = share.paths.load_manifest(share_id).unwrap();
+        assert_eq!(stored.symlinks, remote.symlinks);
+        let scanned = scan_manifest(
+            &root,
+            &stored,
+            share.paths.load_clock(share_id).unwrap(),
+            &local_endpoint,
+            3,
+        )
+        .unwrap();
+        assert_eq!(scanned.changes, 0);
+        assert_eq!(scanned.manifest.symlinks, remote.symlinks);
     }
 
     #[cfg(unix)]

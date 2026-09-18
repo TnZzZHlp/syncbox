@@ -361,6 +361,11 @@ pub fn scan_manifest(
     let discovered = discover_entries(root, previous, unknown_permissions_match)?;
     let mut entries = BTreeMap::new();
     let mut directories = BTreeMap::new();
+    // Windows follows Syncthing's policy: remote symlinks remain as unsupported index state
+    // without being materialized in the shared directory.
+    #[cfg(windows)]
+    let mut symlinks = previous.symlinks.clone();
+    #[cfg(not(windows))]
     let mut symlinks = BTreeMap::new();
     let mut tombstones = previous.tombstones.clone();
     let mut changes = 0_usize;
@@ -401,6 +406,7 @@ pub fn scan_manifest(
             }
         };
         let _ = tombstones.remove(path);
+        let _ = symlinks.remove(path);
         entries.insert(path.clone(), entry);
     }
 
@@ -426,6 +432,7 @@ pub fn scan_manifest(
             }
         };
         let _ = tombstones.remove(path);
+        let _ = symlinks.remove(path);
         directories.insert(path.clone(), entry);
     }
 
@@ -451,6 +458,10 @@ pub fn scan_manifest(
         .chain(previous.directories.keys())
         .chain(previous.symlinks.keys())
     {
+        #[cfg(windows)]
+        if previous.symlinks.contains_key(path) {
+            continue;
+        }
         if !discovered.files.contains_key(path)
             && !discovered.directories.contains_key(path)
             && !discovered.symlinks.contains_key(path)
@@ -526,6 +537,9 @@ fn discover_entries(
 
     let mut files = BTreeMap::new();
     let mut directories = BTreeMap::new();
+    #[cfg(windows)]
+    let symlinks = BTreeMap::new();
+    #[cfg(not(windows))]
     let mut symlinks = BTreeMap::new();
     for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
         let entry =
@@ -547,15 +561,25 @@ fn discover_entries(
         }
         let path = relative_manifest_path(root, entry.path())?;
         if file_type.is_symlink() {
-            let target = fs::read_link(entry.path())
-                .with_context(|| format!("unable to read symlink {}", entry.path().display()))?;
-            let target = target
-                .to_str()
-                .ok_or_else(|| anyhow!("local symlink target is not valid UTF-8"))?
-                .to_owned();
-            validate_symlink_target(&target)?;
-            symlinks.insert(path, DiscoveredSymlink { target });
-            continue;
+            // Match Syncthing: Windows does not publish local symlinks. Remote symlinks are
+            // retained separately by scan_manifest as unsupported synchronized state.
+            #[cfg(windows)]
+            {
+                continue;
+            }
+            #[cfg(not(windows))]
+            {
+                let target = fs::read_link(entry.path()).with_context(|| {
+                    format!("unable to read symlink {}", entry.path().display())
+                })?;
+                let target = target
+                    .to_str()
+                    .ok_or_else(|| anyhow!("local symlink target is not valid UTF-8"))?
+                    .to_owned();
+                validate_symlink_target(&target)?;
+                symlinks.insert(path, DiscoveredSymlink { target });
+                continue;
+            }
         }
         let metadata = entry
             .metadata()

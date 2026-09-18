@@ -49,6 +49,7 @@ fn init_and_status_keep_state_outside_the_shared_directory() {
     assert_eq!(shares.len(), 1);
     assert_eq!(shares[0]["name"], "config");
     assert_eq!(shares[0]["files"], 1);
+    assert_eq!(shares[0]["unsupported_items"], 0);
     assert_eq!(shares[0]["runtime"], "stopped");
     assert!(shares[0].get("share_secret").is_none());
 }

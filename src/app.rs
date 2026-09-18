@@ -395,13 +395,29 @@ impl App {
             let assessment = self.assess_runtime(share_id, status.as_ref(), now_ms)?;
             let stored = status.unwrap_or_else(|| RuntimeStatus::stopped(now_ms));
             let last_scan_at_ms = stored.last_scan_at_ms.or(Some(manifest.scanned_at_ms));
+            let unsupported_items = unsupported_symlink_count(&manifest);
+            let runtime = if unsupported_items > 0 && assessment.runtime != RuntimeState::Stopped {
+                RuntimeState::Degraded
+            } else {
+                assessment.runtime
+            };
+            let health = if unsupported_items > 0 {
+                SyncHealth::Error
+            } else {
+                stored.health
+            };
+            let last_error = if unsupported_items > 0 {
+                Some("symbolic links are unsupported on Windows".to_owned())
+            } else {
+                stored.last_error
+            };
             let output = ShareStatus {
                 share_id: share_id.to_string(),
                 name: config.name.clone(),
                 local_directory: config.local_directory,
                 endpoint_id: endpoint_id.clone().unwrap_or_default(),
-                runtime: assessment.runtime.as_str().to_owned(),
-                health: stored.health.as_str().to_owned(),
+                runtime: runtime.as_str().to_owned(),
+                health: health.as_str().to_owned(),
                 files: manifest.entries.len(),
                 tombstones: manifest.tombstones.len(),
                 known_peers: peers.peers.len(),
@@ -412,11 +428,12 @@ impl App {
                 },
                 pending_downloads: stored.pending_downloads,
                 pending_updates: stored.pending_updates,
+                unsupported_items,
                 last_local_scan: format_timestamp(last_scan_at_ms),
                 last_remote_update: format_timestamp(stored.last_remote_update_at_ms),
                 last_successful_sync: format_timestamp(stored.last_sync_at_ms),
                 last_connection: format_timestamp(stored.last_connection_at_ms),
-                last_error: stored.last_error,
+                last_error,
             };
             details.push(StatusDetails {
                 heartbeat_stale: assessment.heartbeat_stale,
@@ -580,6 +597,7 @@ pub struct ShareStatus {
     pub connected_peers: usize,
     pub pending_downloads: usize,
     pub pending_updates: usize,
+    pub unsupported_items: usize,
     pub last_local_scan: Option<String>,
     pub last_remote_update: Option<String>,
     pub last_successful_sync: Option<String>,
@@ -724,6 +742,16 @@ fn determine_share_name(local_directory: &Path, requested_name: Option<&str>) ->
     Ok(name)
 }
 
+#[cfg(windows)]
+fn unsupported_symlink_count(manifest: &Manifest) -> usize {
+    manifest.symlinks.len()
+}
+
+#[cfg(not(windows))]
+const fn unsupported_symlink_count(_manifest: &Manifest) -> usize {
+    0
+}
+
 fn format_timestamp(value: Option<u64>) -> Option<String> {
     value.and_then(|milliseconds| {
         i64::try_from(milliseconds)
@@ -752,6 +780,7 @@ fn format_human_share_status(details: &StatusDetails) -> String {
         String::new(),
         format!("Pending downloads: {}", status.pending_downloads),
         format!("Pending updates: {}", status.pending_updates),
+        format!("Unsupported items: {}", status.unsupported_items),
         String::new(),
         format!(
             "Last local scan: {}",
