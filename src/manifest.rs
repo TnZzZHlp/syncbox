@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::Read,
@@ -280,9 +281,24 @@ impl Tombstone {
     }
 }
 
+thread_local! {
+    // ponytail: bounded positive cache; use per-manifest deduplication if authors exceed 64 per thread.
+    static VALID_AUTHORS: RefCell<Vec<[u8; 32]>> = const { RefCell::new(Vec::new()) };
+}
+
 fn validate_timestamp(timestamp: &HlcTimestamp) -> Result<()> {
+    if VALID_AUTHORS.with(|authors| authors.borrow().contains(&timestamp.author)) {
+        return Ok(());
+    }
     EndpointId::from_bytes(&timestamp.author)
         .map_err(|_| anyhow!("manifest has an invalid HLC author"))?;
+    VALID_AUTHORS.with(|authors| {
+        let mut authors = authors.borrow_mut();
+        if authors.len() == 64 {
+            authors.clear();
+        }
+        authors.push(timestamp.author);
+    });
     Ok(())
 }
 
@@ -872,6 +888,36 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn cached_hlc_authors_still_reject_invalid_keys() {
+        let valid = HlcTimestamp {
+            wall_ms: 1,
+            counter: 0,
+            author: *SecretKey::from_bytes(&[2; 32]).public().as_bytes(),
+        };
+        assert!(validate_timestamp(&valid).is_ok());
+        assert!(validate_timestamp(&valid).is_ok());
+        let invalid_author = (0_u8..=255)
+            .map(|byte| [byte; 32])
+            .find(|bytes| EndpointId::from_bytes(bytes).is_err())
+            .expect("some compressed points are invalid");
+        let invalid = HlcTimestamp {
+            author: invalid_author,
+            ..valid
+        };
+        assert!(validate_timestamp(&invalid).is_err());
+        assert!(validate_timestamp(&invalid).is_err());
+        for byte in 0..=64 {
+            let author = HlcTimestamp {
+                author: *SecretKey::from_bytes(&[byte; 32]).public().as_bytes(),
+                ..valid
+            };
+            validate_timestamp(&author).unwrap();
+        }
+        VALID_AUTHORS.with(|authors| assert!(authors.borrow().len() <= 64));
+        assert!(validate_timestamp(&invalid).is_err());
+    }
 
     #[test]
     fn scanner_preserves_versions_for_unchanged_files() {

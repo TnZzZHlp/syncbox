@@ -3,8 +3,11 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
-    time::Duration,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -15,13 +18,14 @@ use iroh::{
     address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher, PkarrResolver},
     endpoint::{Connection, RecvStream, SendStream, presets},
 };
+use notify::{RecursiveMode, Watcher};
 use rand::Rng as _;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, Notify, Semaphore},
     task::JoinHandle,
     time::timeout,
 };
@@ -56,6 +60,8 @@ const MAX_CONCURRENT_SHARES: usize = 4;
 // ponytail: two concurrent peer sessions; tune after per-share I/O measurements.
 const MAX_CONCURRENT_PEERS: usize = 2;
 const SYNC_INTERVAL: Duration = Duration::from_secs(5);
+const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(60);
+const IDLE_PEER_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const WINDOWS_SYMLINK_ERROR: &str = "symbolic links are unsupported on Windows";
 
@@ -84,10 +90,117 @@ struct ActiveShare {
     receive_lock: Arc<Mutex<()>>,
     operation_lock: Arc<Mutex<()>>,
     status_lock: Arc<std::sync::Mutex<()>>,
+    manifest_generation: Arc<AtomicU64>,
+    manifest_cache: Arc<std::sync::Mutex<Option<Arc<ManifestSnapshot>>>>,
+    peer_schedule: Arc<Mutex<PeerSchedule>>,
+    scan_dirty: Arc<AtomicBool>,
+    watcher_active: Arc<AtomicBool>,
+    last_scan: Arc<Mutex<Option<Instant>>>,
     local_endpoint_id: EndpointId,
 }
 
+struct ManifestSnapshot {
+    digest: [u8; 32],
+    manifest: Manifest,
+    #[cfg(windows)]
+    unsupported_items: usize,
+}
+
+impl ManifestSnapshot {
+    // DataPaths validates both loaded and saved manifests before they enter this cache.
+    fn from_validated(manifest: Manifest) -> Self {
+        Self {
+            digest: manifest.sync_digest_after_validation(),
+            #[cfg(windows)]
+            unsupported_items: unsupported_symlink_count(&manifest),
+            manifest,
+        }
+    }
+}
+
+fn scan_due(last_scan: Option<Instant>, now: Instant, watching: bool, dirty: bool) -> bool {
+    last_scan.is_none_or(|last| {
+        let elapsed = now.saturating_duration_since(last);
+        (dirty && elapsed >= SYNC_INTERVAL)
+            || elapsed
+                >= if watching {
+                    FULL_SCAN_INTERVAL
+                } else {
+                    SYNC_INTERVAL
+                }
+    })
+}
+
+// ponytail: one deadline per share; use per-peer deadlines if mixed online/offline peers need faster recovery.
+#[derive(Default)]
+struct PeerSchedule {
+    next_at: Option<Instant>,
+    last_attempted_generation: u64,
+    failures: u32,
+}
+
+impl PeerSchedule {
+    fn due(&self, now: Instant, generation: u64) -> bool {
+        generation != self.last_attempted_generation || self.next_at.is_none_or(|at| now >= at)
+    }
+
+    fn after_attempt(&mut self, now: Instant, generation: u64, outcome: Option<&SyncOutcome>) {
+        self.last_attempted_generation = generation;
+        let delay = match outcome {
+            Some(outcome) if outcome.connected => {
+                self.failures = 0;
+                if outcome.pending_downloads > 0 || outcome.pending_updates > 0 {
+                    SYNC_INTERVAL
+                } else {
+                    IDLE_PEER_INTERVAL
+                }
+            }
+            _ => {
+                let delay =
+                    (SYNC_INTERVAL * (1_u32 << self.failures.min(3))).min(IDLE_PEER_INTERVAL);
+                self.failures = self.failures.saturating_add(1);
+                delay
+            }
+        };
+        self.next_at = Some(now + delay);
+    }
+}
+
 impl ActiveShare {
+    fn manifest_snapshot(&self) -> Result<Arc<ManifestSnapshot>> {
+        let mut cache = self
+            .manifest_cache
+            .lock()
+            .map_err(|_| anyhow!("manifest cache lock was poisoned"))?;
+        if let Some(snapshot) = cache.as_ref() {
+            return Ok(Arc::clone(snapshot));
+        }
+        let manifest = self.paths.load_manifest(self.share_id)?;
+        let snapshot = Arc::new(ManifestSnapshot::from_validated(manifest));
+        *cache = Some(Arc::clone(&snapshot));
+        drop(cache);
+        Ok(snapshot)
+    }
+
+    fn save_manifest(&self, manifest: Manifest) -> Result<()> {
+        if manifest.share_id != self.share_id {
+            bail!("manifest belongs to another share");
+        }
+        let mut cache = self
+            .manifest_cache
+            .lock()
+            .map_err(|_| anyhow!("manifest cache lock was poisoned"))?;
+        if let Err(error) = self.paths.save_manifest(&manifest) {
+            *cache = None;
+            self.manifest_generation.fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
+        *cache = Some(Arc::new(ManifestSnapshot::from_validated(manifest)));
+        self.manifest_generation.fetch_add(1, Ordering::Relaxed);
+        drop(cache);
+        Ok(())
+    }
+
     fn config(&self) -> Result<ShareConfig> {
         self.config
             .read()
@@ -158,7 +271,14 @@ pub async fn run(
     };
 
     let accept_task = spawn_accept_loop(endpoint.clone(), registry.clone());
-    let result = run_cycles(&endpoint, &registry, once).await;
+    let scan_notify = Arc::new(Notify::new());
+    let watchers = if once {
+        Vec::new()
+    } else {
+        start_watchers(&registry, &scan_notify)
+    };
+    let result = run_cycles(&endpoint, &registry, once, &scan_notify).await;
+    drop(watchers);
     endpoint.close().await;
     if let Err(error) = accept_task.await {
         warn!(
@@ -274,6 +394,57 @@ fn cleanup_initial_sync_error(share: &Arc<ActiveShare>, error: anyhow::Error) ->
     error.context("initial synchronization failed")
 }
 
+fn scan_event_is_relevant(event: &notify::Event) -> bool {
+    use notify::EventKind;
+    use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
+
+    event.need_rescan()
+        || !matches!(
+            event.kind,
+            EventKind::Access(
+                AccessKind::Open(_) | AccessKind::Read | AccessKind::Close(AccessMode::Read)
+            ) | EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))
+        )
+}
+
+fn start_watchers(
+    registry: &ShareRegistry,
+    scan_notify: &Arc<Notify>,
+) -> Vec<notify::RecommendedWatcher> {
+    let mut watchers = Vec::new();
+    for share in registry.values() {
+        let Ok(root) = share.config().and_then(|config| config_root(&config)) else {
+            continue;
+        };
+        let dirty = Arc::clone(&share.scan_dirty);
+        let active = Arc::clone(&share.watcher_active);
+        let notify = Arc::clone(scan_notify);
+        let share_id = share.share_id;
+        active.store(true, Ordering::Release);
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            let unreliable = event.as_ref().map_or(true, notify::Event::need_rescan);
+            if unreliable && active.swap(false, Ordering::AcqRel) {
+                warn!(share_id = %share_id, "file watcher unreliable; using five-second scans");
+            }
+            if event.as_ref().map_or(true, scan_event_is_relevant)
+                && !dirty.swap(true, Ordering::AcqRel)
+            {
+                notify.notify_one();
+            }
+        });
+        if let Ok(watcher) = watcher.and_then(|mut watcher| {
+            watcher.watch(&root, RecursiveMode::Recursive)?;
+            Ok(watcher)
+        }) {
+            watchers.push(watcher);
+        } else {
+            share.watcher_active.store(false, Ordering::Release);
+            warn!(share_id = %share.share_id, "file watcher unavailable; using five-second scans");
+        }
+    }
+    watchers
+}
+
 fn load_registry(
     paths: &DataPaths,
     endpoint_id: EndpointId,
@@ -291,6 +462,12 @@ fn load_registry(
                 receive_lock: Arc::new(Mutex::new(())),
                 operation_lock: Arc::new(Mutex::new(())),
                 status_lock: Arc::new(std::sync::Mutex::new(())),
+                manifest_generation: Arc::new(AtomicU64::new(0)),
+                manifest_cache: Arc::new(std::sync::Mutex::new(None)),
+                peer_schedule: Arc::new(Mutex::new(PeerSchedule::default())),
+                scan_dirty: Arc::new(AtomicBool::new(true)),
+                watcher_active: Arc::new(AtomicBool::new(false)),
+                last_scan: Arc::new(Mutex::new(None)),
                 local_endpoint_id: endpoint_id,
             }),
         );
@@ -371,7 +548,12 @@ fn spawn_accept_loop(endpoint: Endpoint, registry: ShareRegistry) -> JoinHandle<
     })
 }
 
-async fn run_cycles(endpoint: &Endpoint, registry: &ShareRegistry, once: bool) -> Result<()> {
+async fn run_cycles(
+    endpoint: &Endpoint,
+    registry: &ShareRegistry,
+    once: bool,
+    scan_notify: &Notify,
+) -> Result<()> {
     // Connection and transfer deadlines may be much longer than the status freshness window.
     // Refresh status independently so a healthy process is never reported as stopped merely
     // because one peer is slow or unreachable.
@@ -380,7 +562,7 @@ async fn run_cycles(endpoint: &Endpoint, registry: &ShareRegistry, once: bool) -
         if once {
             Ok(())
         } else {
-            run_periodic_cycles(endpoint, registry).await
+            run_periodic_cycles(endpoint, registry, scan_notify).await
         }
     } else {
         Ok(())
@@ -390,7 +572,11 @@ async fn run_cycles(endpoint: &Endpoint, registry: &ShareRegistry, once: bool) -
     result
 }
 
-async fn run_periodic_cycles(endpoint: &Endpoint, registry: &ShareRegistry) -> Result<()> {
+async fn run_periodic_cycles(
+    endpoint: &Endpoint,
+    registry: &ShareRegistry,
+    scan_notify: &Notify,
+) -> Result<()> {
     loop {
         tokio::select! {
             shutdown = wait_for_shutdown_signal() => {
@@ -398,6 +584,7 @@ async fn run_periodic_cycles(endpoint: &Endpoint, registry: &ShareRegistry) -> R
                 return Ok(());
             }
             () = tokio::time::sleep(SYNC_INTERVAL) => {}
+            () = scan_notify.notified() => {}
         }
         // A cycle may be waiting for a peer. Keep shutdown responsive instead of postponing a
         // service-manager signal until connection and transfer deadlines expire.
@@ -511,12 +698,40 @@ fn run_blocking<T>(operation: impl FnOnce() -> T) -> T {
 async fn sync_active_share(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Result<()> {
     let config = share.config()?;
     if config.initial_sync_complete {
-        // Keep the operation lock held while blocking work runs; a detached blocking task could
-        // outlive a cancelled synchronization cycle during shutdown.
-        let _operation_lock = share.operation_lock.lock().await;
-        run_blocking(|| scan_and_save(share, &config))?;
+        let due = scan_due(
+            *share.last_scan.lock().await,
+            Instant::now(),
+            share.watcher_active.load(Ordering::Acquire),
+            share.scan_dirty.load(Ordering::Acquire),
+        );
+        if due {
+            share.scan_dirty.swap(false, Ordering::AcqRel);
+            // Keep the operation lock held while blocking work runs; a detached blocking task
+            // could outlive a cancelled synchronization cycle during shutdown.
+            let _operation_lock = share.operation_lock.lock().await;
+            if let Err(error) = run_blocking(|| scan_and_save(share, &config)) {
+                share.scan_dirty.store(true, Ordering::Release);
+                return Err(error);
+            }
+            *share.last_scan.lock().await = Some(Instant::now());
+        }
     }
-    sync_known_peers(endpoint, share).await.map(|_| ())
+    let generation = share.manifest_generation.load(Ordering::Relaxed);
+    if !share
+        .peer_schedule
+        .lock()
+        .await
+        .due(Instant::now(), generation)
+    {
+        return Ok(());
+    }
+    let result = sync_known_peers(endpoint, share).await;
+    share.peer_schedule.lock().await.after_attempt(
+        Instant::now(),
+        generation,
+        result.as_ref().ok(),
+    );
+    result.map(|_| ())
 }
 
 #[derive(Default)]
@@ -667,8 +882,10 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
             }
         }
     }
-    outcome.unsupported_items =
-        unsupported_symlink_count(&share.paths.load_manifest(share.share_id)?);
+    #[cfg(windows)]
+    {
+        outcome.unsupported_items = share.manifest_snapshot()?.unsupported_items;
+    }
     if outcome.connected {
         let completely_synchronized = outcome.pending_downloads == 0
             && outcome.pending_updates == 0
@@ -763,15 +980,13 @@ async fn sync_with_peer(
         "peer authentication completed"
     );
 
-    let outbound_manifest = if config.initial_sync_complete {
-        share.paths.load_manifest(share.share_id)?
-    } else {
-        Manifest::empty(share.share_id, current_time_ms())
-    };
-    let outbound_digest = if config.initial_sync_complete {
-        outbound_manifest.sync_digest_after_validation()
-    } else {
-        outbound_manifest.sync_digest(share.share_id)?
+    let outbound_snapshot = config
+        .initial_sync_complete
+        .then(|| share.manifest_snapshot())
+        .transpose()?;
+    let outbound_digest = match &outbound_snapshot {
+        Some(snapshot) => snapshot.digest,
+        None => Manifest::empty(share.share_id, current_time_ms()).sync_digest(share.share_id)?,
     };
     let known_peers = known_peer_strings(share, &expected_peer)?;
     write_json_frame(
@@ -816,6 +1031,10 @@ async fn sync_with_peer(
         });
     }
 
+    let outbound_manifest = outbound_snapshot.map_or_else(
+        || Manifest::empty(share.share_id, current_time_ms()),
+        |snapshot| snapshot.manifest.clone(),
+    );
     info!(
         share_id = %share.share_id,
         peer_endpoint_id = %expected_peer,
@@ -966,11 +1185,11 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
     let (local_manifest, known_peers) = {
         let _operation_lock = share.operation_lock.lock().await;
         merge_remote_peers(&share, request.known_peers.iter(), Some(peer_endpoint_id))?;
-        let local_manifest = share.paths.load_manifest(share.share_id)?;
+        let local_snapshot = share.manifest_snapshot()?;
         let known_peers = known_peer_strings(&share, &peer_endpoint_id)?;
-        (local_manifest, known_peers)
+        (local_snapshot, known_peers)
     };
-    let local_digest = local_manifest.sync_digest_after_validation();
+    let local_digest = local_manifest.digest;
     write_json_frame(
         &mut send,
         &SyncResponse {
@@ -986,7 +1205,7 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
         send.finish()
             .context("unable to finish unchanged sync stream")?;
         let _ = timeout(Duration::from_secs(5), send.stopped()).await;
-        let unsupported_items = unsupported_symlink_count(&local_manifest);
+        let unsupported_items = unsupported_symlink_count(&local_manifest.manifest);
         update_runtime(&share, |status, now_ms| {
             status.last_connection_at_ms = Some(now_ms);
             status.pending_downloads = 0;
@@ -1018,7 +1237,7 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
     let local_message = ManifestMessage {
         protocol_version: PROTOCOL_VERSION,
         share_id: share.share_id,
-        manifest: local_manifest,
+        manifest: local_manifest.manifest.clone(),
     };
     write_json_frame(&mut send, &local_message).await?;
     info!(
@@ -1057,9 +1276,9 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
         let applied = run_blocking(|| {
             apply_remote_staged_transfer(&share, &remote_message.manifest, &uploaded)
         })?;
-        let final_manifest = share.paths.load_manifest(share.share_id)?;
+        let final_manifest = share.manifest_snapshot()?;
         let files = build_transfer_files(
-            &final_manifest,
+            &final_manifest.manifest,
             &transfer.download_paths,
             &transfer.download_resumes,
         )?;
@@ -1079,7 +1298,7 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
         &TransferResponse {
             protocol_version: PROTOCOL_VERSION,
             share_id: share.share_id,
-            manifest: final_manifest,
+            manifest: final_manifest.manifest.clone(),
             files: files.clone(),
         },
     )
@@ -1939,7 +2158,8 @@ fn apply_remote_transfer_impl(
 ) -> Result<ApplyOutcome> {
     let config = share.config()?;
     let root = config_root(&config)?;
-    let local = share.paths.load_manifest(share.share_id)?;
+    let local_snapshot = share.manifest_snapshot()?;
+    let local = &local_snapshot.manifest;
 
     let mut candidate = local.clone();
     let mut pending_downloads = 0_usize;
@@ -2062,15 +2282,15 @@ fn apply_remote_transfer_impl(
     }
     candidate.scanned_at_ms = current_time_ms();
     candidate.validate(share.share_id)?;
+    let unsupported_items = unsupported_symlink_count(&candidate);
     if candidate.entries != local.entries
         || candidate.directories != local.directories
         || candidate.symlinks != local.symlinks
         || candidate.tombstones != local.tombstones
     {
         observe_manifest_clock(share, &candidate)?;
-        share.paths.save_manifest(&candidate)?;
+        share.save_manifest(candidate)?;
     }
-    let unsupported_items = unsupported_symlink_count(&candidate);
     debug!(
         share_id = %share.share_id,
         applied_records,
@@ -2118,10 +2338,16 @@ fn observe_manifest_clock(share: &Arc<ActiveShare>, manifest: &Manifest) -> Resu
 
 fn scan_and_save(share: &Arc<ActiveShare>, config: &ShareConfig) -> Result<()> {
     let root = config_root(config)?;
-    let manifest = share.paths.load_manifest(share.share_id)?;
+    let snapshot = share.manifest_snapshot()?;
     let clock = share.paths.load_clock(share.share_id)?;
     let now_ms = current_time_ms();
-    let scanned = scan_manifest(&root, &manifest, clock, &share.local_endpoint_id, now_ms)?;
+    let scanned = scan_manifest(
+        &root,
+        &snapshot.manifest,
+        clock,
+        &share.local_endpoint_id,
+        now_ms,
+    )?;
     if scanned.changes > 0 {
         info!(
             share_id = %share.share_id,
@@ -2137,7 +2363,7 @@ fn scan_and_save(share: &Arc<ActiveShare>, config: &ShareConfig) -> Result<()> {
         share.paths.save_clock(share.share_id, &scanned.clock)?;
     }
     if scanned.manifest_changed {
-        share.paths.save_manifest(&scanned.manifest)?;
+        share.save_manifest(scanned.manifest)?;
     }
     update_runtime(share, |status, _| {
         status.last_scan_at_ms = Some(now_ms);
@@ -3193,6 +3419,134 @@ mod tests {
     }
 
     #[test]
+    fn read_events_do_not_rescan_but_write_events_and_overflow_do() {
+        use notify::{
+            Event, EventKind,
+            event::{AccessKind, AccessMode, Flag},
+        };
+
+        let read = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Read)));
+        assert!(!scan_event_is_relevant(&read));
+        let write = Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)));
+        assert!(scan_event_is_relevant(&write));
+        assert!(scan_event_is_relevant(&read.set_flag(Flag::Rescan)));
+    }
+
+    #[test]
+    fn scans_follow_events_with_a_bounded_full_scan_fallback() {
+        let now = Instant::now();
+        assert!(scan_due(None, now, true, false));
+        assert!(!scan_due(
+            Some(now),
+            now + Duration::from_secs(59),
+            true,
+            false
+        ));
+        assert!(scan_due(Some(now), now + FULL_SCAN_INTERVAL, true, false));
+        assert!(!scan_due(Some(now), now, true, true));
+        assert!(scan_due(Some(now), now + SYNC_INTERVAL, true, true));
+        assert!(!scan_due(
+            Some(now),
+            now + Duration::from_secs(4),
+            false,
+            false
+        ));
+        assert!(scan_due(Some(now), now + SYNC_INTERVAL, false, false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_changes_wake_a_watched_share() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+        let share_id = ShareId([56; 32]);
+        let endpoint = SecretKey::from_bytes(&[57; 32]).public();
+        let share = active_share(&root, Manifest::empty(share_id, 0), endpoint);
+        let registry = ShareRegistry {
+            shares: Arc::new(HashMap::from([(share_id, Arc::clone(&share))])),
+        };
+        let notify = Arc::new(Notify::new());
+        let watchers = start_watchers(&registry, &notify);
+        if watchers.is_empty() {
+            assert!(!share.watcher_active.load(Ordering::Acquire));
+            return; // Systems without available inotify watches use the five-second fallback.
+        }
+        share.scan_dirty.store(false, Ordering::Release);
+        fs::write(root.join("changed.txt"), b"new content").unwrap();
+        timeout(Duration::from_secs(3), async {
+            while !share.scan_dirty.load(Ordering::Acquire) {
+                notify.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(share.watcher_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn idle_peer_schedule_preserves_change_and_pending_work_latency() {
+        let now = Instant::now();
+        let mut schedule = PeerSchedule::default();
+        assert!(schedule.due(now, 0));
+        schedule.after_attempt(
+            now,
+            0,
+            Some(&SyncOutcome {
+                connected: true,
+                ..SyncOutcome::default()
+            }),
+        );
+        assert!(!schedule.due(now + Duration::from_secs(29), 0));
+        assert!(schedule.due(now + IDLE_PEER_INTERVAL, 0));
+        assert!(schedule.due(now, 1));
+
+        schedule.after_attempt(
+            now,
+            1,
+            Some(&SyncOutcome {
+                connected: true,
+                pending_downloads: 1,
+                ..SyncOutcome::default()
+            }),
+        );
+        assert!(!schedule.due(now + Duration::from_secs(4), 1));
+        assert!(schedule.due(now + SYNC_INTERVAL, 1));
+        schedule.after_attempt(
+            now,
+            1,
+            Some(&SyncOutcome {
+                connected: true,
+                pending_updates: 1,
+                ..SyncOutcome::default()
+            }),
+        );
+        assert!(schedule.due(now + SYNC_INTERVAL, 1));
+    }
+
+    #[test]
+    fn offline_peer_schedule_backs_off_but_recovers_after_a_change() {
+        let now = Instant::now();
+        let mut schedule = PeerSchedule::default();
+        for expected in [5, 10, 20, 30, 30] {
+            schedule.after_attempt(now, 0, None);
+            assert!(!schedule.due(now + Duration::from_secs(expected - 1), 0));
+            assert!(schedule.due(now + Duration::from_secs(expected), 0));
+        }
+        assert!(schedule.due(now, 1));
+        schedule.after_attempt(
+            now,
+            1,
+            Some(&SyncOutcome {
+                connected: true,
+                ..SyncOutcome::default()
+            }),
+        );
+        schedule.after_attempt(now, 1, None);
+        assert!(schedule.due(now + SYNC_INTERVAL, 1));
+    }
+
+    #[test]
     fn unfiltered_pkarr_candidates_keep_direct_addresses() {
         let data = EndpointData::from_iter([
             TransportAddr::Ip("192.0.2.1:443".parse().unwrap()),
@@ -3385,6 +3739,120 @@ mod tests {
         validate_transfer_files(&[file], &manifest).unwrap();
     }
 
+    #[test]
+    fn cached_manifest_tracks_local_scans_and_remote_merges() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+        let share_id = ShareId([50; 32]);
+        let endpoint = SecretKey::from_bytes(&[51; 32]).public();
+        let share = active_share(&root, Manifest::empty(share_id, 0), endpoint);
+        let initial = share.manifest_snapshot().unwrap();
+        assert!(Arc::ptr_eq(&initial, &share.manifest_snapshot().unwrap()));
+
+        fs::write(root.join("local.txt"), b"local").unwrap();
+        scan_and_save(&share, &share.config().unwrap()).unwrap();
+        let scanned = share.manifest_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&initial, &scanned));
+        assert_eq!(share.manifest_generation.load(Ordering::Relaxed), 1);
+        assert!(Arc::ptr_eq(&scanned, &share.manifest_snapshot().unwrap()));
+
+        let bytes = b"remote";
+        let remote = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            share_id,
+            scanned_at_ms: 1,
+            entries: BTreeMap::from([(
+                "remote.txt".to_owned(),
+                ManifestEntry {
+                    size: bytes.len() as u64,
+                    modified_at_ns: 0,
+                    sha256: hex::encode(Sha256::digest(bytes)),
+                    permissions: None,
+                    version: timestamp(1, SecretKey::from_bytes(&[52; 32]).public()),
+                },
+            )]),
+            directories: BTreeMap::new(),
+            symlinks: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
+        };
+        apply_remote_transfer(
+            &share,
+            &remote,
+            &[FilePayload {
+                path: "remote.txt".to_owned(),
+                sha256: hex::encode(Sha256::digest(bytes)),
+                content: URL_SAFE_NO_PAD.encode(bytes),
+            }],
+        )
+        .unwrap();
+        let merged = share.manifest_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&scanned, &merged));
+        assert_eq!(share.manifest_generation.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            merged.digest,
+            share
+                .paths
+                .load_manifest(share_id)
+                .unwrap()
+                .sync_digest(share_id)
+                .unwrap()
+        );
+        assert!(merged.manifest.entries.contains_key("local.txt"));
+        assert!(merged.manifest.entries.contains_key("remote.txt"));
+    }
+
+    #[test]
+    fn failed_manifest_save_invalidates_snapshot_and_schedules_retry() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+        let share_id = ShareId([58; 32]);
+        let endpoint = SecretKey::from_bytes(&[59; 32]).public();
+        let share = active_share(&root, Manifest::empty(share_id, 0), endpoint);
+        let cached = share.manifest_snapshot().unwrap();
+
+        // A parent-directory fsync failure after rename is not injectable without a
+        // production-only storage test hook. Model disk containing a replacement before
+        // the attempted save fails DataPaths validation.
+        let mut persisted = cached.manifest.clone();
+        persisted.scanned_at_ms = 1;
+        share.paths.save_manifest(&persisted).unwrap();
+        let mut invalid = persisted;
+        invalid.format_version = u16::MAX;
+        assert!(share.save_manifest(invalid).is_err());
+
+        assert_eq!(share.manifest_generation.load(Ordering::Relaxed), 1);
+        let mut schedule = PeerSchedule::default();
+        let now = Instant::now();
+        schedule.after_attempt(now, 0, Some(&SyncOutcome::default()));
+        assert!(!schedule.due(now, 0));
+        assert!(schedule.due(now, 1));
+
+        let recovered = share.manifest_snapshot().unwrap();
+        assert!(!Arc::ptr_eq(&cached, &recovered));
+        assert_eq!(recovered.manifest.scanned_at_ms, 1);
+    }
+
+    #[test]
+    fn invalid_manifest_does_not_replace_a_valid_snapshot() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+        let share_id = ShareId([53; 32]);
+        let endpoint = SecretKey::from_bytes(&[54; 32]).public();
+        let share = active_share(&root, Manifest::empty(share_id, 0), endpoint);
+        let snapshot = share.manifest_snapshot().unwrap();
+        let invalid = Manifest::empty(ShareId([55; 32]), 0);
+        assert!(share.save_manifest(invalid).is_err());
+        assert!(Arc::ptr_eq(&snapshot, &share.manifest_snapshot().unwrap()));
+        assert_eq!(share.manifest_generation.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            share.paths.load_manifest(share_id).unwrap().share_id,
+            share_id
+        );
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     fn active_share(root: &Path, manifest: Manifest, endpoint: EndpointId) -> Arc<ActiveShare> {
         let paths = DataPaths::from_root(root.parent().unwrap().join("state"));
@@ -3414,6 +3882,12 @@ mod tests {
             receive_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(Mutex::new(())),
             status_lock: Arc::new(std::sync::Mutex::new(())),
+            manifest_generation: Arc::new(AtomicU64::new(0)),
+            manifest_cache: Arc::new(std::sync::Mutex::new(None)),
+            peer_schedule: Arc::new(Mutex::new(PeerSchedule::default())),
+            scan_dirty: Arc::new(AtomicBool::new(true)),
+            watcher_active: Arc::new(AtomicBool::new(false)),
+            last_scan: Arc::new(Mutex::new(None)),
             local_endpoint_id: endpoint,
         })
     }
