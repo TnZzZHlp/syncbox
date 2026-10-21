@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use directories_next::BaseDirs;
 use fs4::{FileExt, TryLockError};
-use rand::Rng as _;
+use rand::RngExt as _;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{

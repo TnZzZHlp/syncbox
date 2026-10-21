@@ -3,7 +3,7 @@ use std::{cmp::Ordering, fmt, str::FromStr};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::EndpointId;
-use rand::Rng as _;
+use rand::RngExt as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 pub const FORMAT_VERSION: u16 = 1;
