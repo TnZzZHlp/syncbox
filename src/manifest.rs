@@ -441,7 +441,7 @@ pub(crate) fn scan_manifest_cached_after_validation<'a>(
             ManifestEntry {
                 size: old_entry.size,
                 modified_at_ns: discovered_file.modified_at_ns,
-                sha256: discovered_file.sha256,
+                sha256: discovered_file.sha256.into_owned(),
                 permissions: old_entry.permissions,
                 version: old_entry.version,
             }
@@ -451,7 +451,7 @@ pub(crate) fn scan_manifest_cached_after_validation<'a>(
             ManifestEntry {
                 size: discovered_file.size,
                 modified_at_ns: discovered_file.modified_at_ns,
-                sha256: discovered_file.sha256,
+                sha256: discovered_file.sha256.into_owned(),
                 permissions: selected_permissions(
                     old_entry.and_then(|entry| entry.permissions),
                     discovered_file.permissions,
@@ -557,10 +557,10 @@ pub(crate) fn scan_manifest_cached_after_validation<'a>(
 }
 
 #[derive(Clone)]
-struct DiscoveredFile {
+struct DiscoveredFile<'a> {
     size: u64,
     modified_at_ns: u64,
-    sha256: String,
+    sha256: Cow<'a, str>,
     permissions: Option<u16>,
 }
 
@@ -572,13 +572,13 @@ struct DiscoveredSymlink {
     target: String,
 }
 
-struct DiscoveredEntries {
-    files: BTreeMap<String, DiscoveredFile>,
+struct DiscoveredEntries<'a> {
+    files: BTreeMap<String, DiscoveredFile<'a>>,
     directories: BTreeMap<String, DiscoveredDirectory>,
     symlinks: BTreeMap<String, DiscoveredSymlink>,
 }
 
-impl DiscoveredEntries {
+impl DiscoveredEntries<'_> {
     fn matches_previous(&self, previous: &Manifest, unknown_permissions_match: bool) -> bool {
         if previous.format_version != MANIFEST_FORMAT_VERSION
             || previous.entries.len() != self.files.len()
@@ -625,11 +625,11 @@ impl DiscoveredEntries {
     }
 }
 
-fn discover_entries(
+fn discover_entries<'a>(
     root: &Path,
-    previous: &Manifest,
+    previous: &'a Manifest,
     unknown_permissions_match: bool,
-) -> Result<DiscoveredEntries> {
+) -> Result<DiscoveredEntries<'a>> {
     let metadata = fs::metadata(root)
         .with_context(|| format!("unable to inspect local directory {}", root.display()))?;
     if !metadata.is_dir() {
@@ -713,7 +713,7 @@ fn discover_entries(
                     (
                         old.size,
                         old.modified_at_ns,
-                        old.sha256.clone(),
+                        Cow::Borrowed(old.sha256.as_str()),
                         old.permissions,
                     )
                 }
@@ -721,7 +721,9 @@ fn discover_entries(
                     if hash_buffer.is_empty() {
                         hash_buffer.resize(HASH_BUFFER_SIZE, 0);
                     }
-                    hash_stable_file(entry.path(), &metadata, &mut hash_buffer)?
+                    let (size, modified_at_ns, sha256, permissions) =
+                        hash_stable_file(entry.path(), &metadata, &mut hash_buffer)?;
+                    (size, modified_at_ns, Cow::Owned(sha256), permissions)
                 }
             };
             files.insert(
