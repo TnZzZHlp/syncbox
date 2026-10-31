@@ -7,18 +7,20 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(not(windows))]
+use anyhow::anyhow;
+use anyhow::{Context, Result, bail};
 use iroh::EndpointId;
 use sha2::{Digest as _, Sha256};
 use walkdir::WalkDir;
 
 use crate::types::ClockState;
 
+#[cfg(not(windows))]
+use super::model::validate_symlink_target;
 use super::{
     LEGACY_MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION, MAX_MANIFEST_ENTRIES,
-    model::{
-        DirectoryEntry, Manifest, ManifestEntry, SymlinkEntry, Tombstone, validate_symlink_target,
-    },
+    model::{DirectoryEntry, Manifest, ManifestEntry, SymlinkEntry, Tombstone},
     path::relative_manifest_path,
 };
 

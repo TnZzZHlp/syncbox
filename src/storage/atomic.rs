@@ -146,6 +146,13 @@ pub(super) fn set_file_permissions(file: &File, _private: bool) -> Result<()> {
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .context("unable to set persistent state file permissions")
 }
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+pub(super) const fn set_file_permissions(_file: &File, _private: bool) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn atomic_replace(temporary: &Path, target: &Path) -> std::io::Result<()> {
     fs::rename(temporary, target)
 }

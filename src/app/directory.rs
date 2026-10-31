@@ -125,7 +125,7 @@ pub fn process_alive(process_id: u32) -> bool {
 
 #[cfg(not(target_os = "linux"))]
 #[allow(clippy::unnecessary_wraps)]
-pub(crate) const fn process_alive(process_id: u32) -> bool {
+pub const fn process_alive(process_id: u32) -> bool {
     if process_id == 0 {
         false
     } else {

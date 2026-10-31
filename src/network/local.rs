@@ -8,6 +8,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use rand::RngExt as _;
 use sha2::{Digest as _, Sha256};
+#[cfg(windows)]
+use tracing::warn;
 
 use crate::{
     manifest::{path_for_manifest, validate_manifest_path},
