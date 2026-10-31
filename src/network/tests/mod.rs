@@ -46,6 +46,7 @@ use crate::{
 };
 
 mod auth;
+mod connection_cache;
 mod lifecycle;
 mod local;
 mod scheduling;

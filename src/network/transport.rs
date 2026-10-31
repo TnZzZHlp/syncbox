@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -10,52 +9,43 @@ use iroh::{
     address_lookup::{AddrFilter, DnsAddressLookup, PkarrPublisher, PkarrResolver},
     endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream, VarInt, presets},
 };
-use tokio::{
-    sync::{Mutex, Semaphore},
-    time::timeout,
+use tokio::{sync::Semaphore, time::timeout};
+
+use super::{
+    SYNCBOX_ALPN,
+    connection_cache::{ConnectionCache, PeerSlot, StreamLease},
+    diagnostics::trace_connection,
 };
 
-use super::{SYNCBOX_ALPN, diagnostics::trace_connection};
+pub(super) use super::connection_cache::{CONNECTION_IDLE_TIMEOUT, MAX_CONNECTION_STREAMS};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_CONCURRENT_DIALS: usize = 8;
-pub(super) const MAX_CONNECTION_STREAMS: u32 = 8;
-pub(super) const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-
-type ConnectionSlot = Arc<Mutex<Option<Connection>>>;
-
 pub(super) struct ConnectionPool {
-    connections: Mutex<HashMap<EndpointId, ConnectionSlot>>,
+    connections: ConnectionCache,
     dial_permits: Semaphore,
 }
 
 impl Default for ConnectionPool {
     fn default() -> Self {
         Self {
-            connections: Mutex::new(HashMap::new()),
+            connections: ConnectionCache::default(),
             dial_permits: Semaphore::new(MAX_CONCURRENT_DIALS),
         }
     }
 }
 
 impl ConnectionPool {
-    async fn connect(&self, endpoint: &Endpoint, peer: EndpointId) -> Result<Connection> {
+    async fn connect(
+        &self,
+        endpoint: &Endpoint,
+        peer: EndpointId,
+    ) -> Result<(Connection, Arc<PeerSlot>)> {
         if endpoint.is_closed() {
             bail!("Iroh endpoint is closed");
         }
-        let slot = {
-            let mut connections = self.connections.lock().await;
-            connections.retain(|_, slot| {
-                Arc::strong_count(slot) > 1
-                    || slot.try_lock().map_or(true, |connection| {
-                        connection
-                            .as_ref()
-                            .is_some_and(|connection| connection.close_reason().is_none())
-                    })
-            });
-            Arc::clone(connections.entry(peer).or_default())
-        };
-        let mut cached = slot.lock().await;
+        let slot = self.connections.slot(peer).await?;
+        let mut cached = slot.connection.lock().await;
         if let Some(connection) = cached
             .as_ref()
             .filter(|connection| connection.close_reason().is_none())
@@ -63,7 +53,7 @@ impl ConnectionPool {
             let connection = connection.clone();
             drop(cached);
             trace_connection(&connection, true, None);
-            return Ok(connection);
+            return Ok((connection, slot));
         }
         *cached = None;
         let _permit = self
@@ -86,13 +76,17 @@ impl ConnectionPool {
         *cached = Some(connection.clone());
         drop(cached);
         trace_connection(&connection, false, Some(started.elapsed()));
-        Ok(connection)
+        Ok((connection, slot))
+    }
+
+    pub(super) async fn maintain(&self) {
+        self.connections.maintain().await;
     }
 
     async fn invalidate(&self, peer: EndpointId, connection: &Connection) {
-        let slot = self.connections.lock().await.get(&peer).cloned();
+        let slot = self.connections.get(peer).await;
         if let Some(slot) = slot {
-            let mut cached = slot.lock().await;
+            let mut cached = slot.connection.lock().await;
             if cached
                 .as_ref()
                 .is_some_and(|cached| cached.stable_id() == connection.stable_id())
@@ -106,17 +100,24 @@ impl ConnectionPool {
         &self,
         endpoint: &Endpoint,
         peer: EndpointId,
-    ) -> Result<(SendStream, RecvStream)> {
+    ) -> Result<(SendStream, RecvStream, StreamLease)> {
         for attempt in 0..2 {
-            let connection = self.connect(endpoint, peer).await?;
-            let result = timeout(CONNECT_TIMEOUT, connection.open_bi()).await;
+            let (connection, slot) = self.connect(endpoint, peer).await?;
+            let lease = tokio::select! {
+                () = endpoint.closed() => bail!("Iroh endpoint is closed"),
+                lease = timeout(CONNECT_TIMEOUT, slot.lease()) => {
+                    lease.context("timed out waiting for peer stream capacity")?
+                }
+            };
+            let result = timeout(CONNECT_TIMEOUT, connection.open_bi())
+                .await
+                .context("timed out opening sync stream")
+                .and_then(|result| result.context("unable to open sync stream"));
             match result {
-                Ok(Ok(stream)) => return Ok(stream),
-                result => {
+                Ok((send, recv)) => return Ok((send, recv, lease)),
+                Err(error) => {
                     if attempt == 1 || connection.close_reason().is_none() {
-                        return result
-                            .context("timed out opening sync stream")?
-                            .context("unable to open sync stream");
+                        return Err(error);
                     }
                     self.invalidate(peer, &connection).await;
                 }
@@ -182,9 +183,11 @@ mod tests {
             pool.connect(&client, server.id())
                 .await
                 .unwrap()
+                .0
                 .closed()
                 .await;
-            let (mut send, mut recv) = pool.open_stream(&client, server.id()).await.unwrap();
+            let (mut send, mut recv, _lease) =
+                pool.open_stream(&client, server.id()).await.unwrap();
             send.write_all(b"reconnected").await.unwrap();
             send.finish().unwrap();
             assert_eq!(recv.read_to_end(16).await.unwrap(), b"reconnected");

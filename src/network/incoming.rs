@@ -39,6 +39,8 @@ use super::{
         validate_transfer_request, write_json_frame,
     },
 };
+const STREAM_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub async fn handle_incoming(
     connection: Connection,
     registry: ShareRegistry,
@@ -63,8 +65,15 @@ pub async fn handle_incoming(
             incoming = timeout(idle_timeout, connection.accept_bi()) => {
                 match incoming {
                     Ok(Ok((send, recv))) => {
-                        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                            continue;
+                        let permit = tokio::select! {
+                            _ = connection.closed() => break,
+                            permit = timeout(STREAM_QUEUE_TIMEOUT, Arc::clone(&permits).acquire_owned()) => {
+                                match permit {
+                                    Ok(Ok(permit)) => permit,
+                                    Ok(Err(_)) => break,
+                                    Err(_) => continue,
+                                }
+                            }
                         };
                         let registry = registry.clone();
                         let authenticated = Arc::clone(&authenticated);

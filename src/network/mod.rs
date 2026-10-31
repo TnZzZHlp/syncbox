@@ -28,6 +28,7 @@ use crate::{
 
 mod auth;
 mod client;
+mod connection_cache;
 mod connectivity;
 mod diagnostics;
 mod incoming;
@@ -44,7 +45,7 @@ mod wire;
 pub use registry::{InitialSyncStatus, attempt_initial_sync};
 
 use connectivity::spawn_connectivity_monitor;
-use lifecycle::{run_cycles, spawn_accept_loop, start_watchers};
+use lifecycle::{run_cycles, spawn_accept_loop, spawn_pool_maintenance, start_watchers};
 use registry::load_registry;
 use state::{set_runtime_error, set_runtime_state, set_stopped};
 use transport::bind_endpoint;
@@ -92,6 +93,7 @@ pub async fn run(
     };
 
     let accept_task = spawn_accept_loop(endpoint.clone(), registry.clone());
+    let maintenance_task = spawn_pool_maintenance(endpoint.clone(), &registry);
     let scan_notify = Arc::new(Notify::new());
     let connectivity_task = (!once).then(|| {
         spawn_connectivity_monitor(endpoint.clone(), registry.clone(), Arc::clone(&scan_notify))
@@ -104,6 +106,9 @@ pub async fn run(
     let result = run_cycles(&endpoint, &registry, once, &scan_notify).await;
     drop(watchers);
     endpoint.close().await;
+    if let Err(error) = maintenance_task.await {
+        warn!(error = %error, "connection pool maintenance failed during shutdown");
+    }
     if let Some(task) = connectivity_task
         && let Err(error) = task.await
     {

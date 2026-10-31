@@ -153,6 +153,26 @@ pub fn spawn_accept_loop(endpoint: Endpoint, registry: ShareRegistry) -> JoinHan
     })
 }
 
+pub fn spawn_pool_maintenance(endpoint: Endpoint, registry: &ShareRegistry) -> JoinHandle<()> {
+    let pool = registry
+        .values()
+        .next()
+        .map(|share| Arc::clone(&share.connections));
+    tokio::spawn(async move {
+        let Some(pool) = pool else {
+            return;
+        };
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tokio::select! {
+                biased;
+                () = endpoint.closed() => break,
+                _ = interval.tick() => pool.maintain().await,
+            }
+        }
+    })
+}
+
 pub async fn run_cycles(
     endpoint: &Endpoint,
     registry: &ShareRegistry,

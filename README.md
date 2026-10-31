@@ -14,11 +14,13 @@ Syncbox is a Rust command-line application for synchronizing multiple independen
 - Unfiltered QUIC candidates through Iroh N0 discovery, with port mapping, automatic direct-path
   selection, and N0 relay fallback. Connections are reused across synchronization rounds and shares;
   each stream authenticates its share independently. Iroh prefers direct paths over relay paths and
-  selects by biased RTT, not measured file-transfer throughput.
+  selects by biased RTT, not measured file-transfer throughput. The outgoing pool holds at most
+  32 peers and evicts only unused connections; active streams retain connection leases.
 - Independent peer retry backoff with jitter and rotating candidate selection. Connection attempts
   have a 20-second deadline and authentication a 10-second deadline. Blocked network reads and writes
   time out after 60 seconds without progress, rather than imposing a fixed total transfer duration.
   Incoming connections without active streams are released after 90 seconds of application inactivity.
+  Busy receivers queue streams for up to 5 seconds instead of immediately resetting them.
 - Local address changes and relay reconnections wake peer retries, coalesced to at most once every
   5 seconds without discarding usable connections. Debug logs include connection reuse, selected
   IPv4/IPv6/relay path snapshots, setup time, and RTT.

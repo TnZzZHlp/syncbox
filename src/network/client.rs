@@ -202,7 +202,7 @@ pub async fn sync_with_peer(
         peer_endpoint_id = %expected_peer,
         "connecting to peer"
     );
-    let (send, recv) = share
+    let (send, recv, _lease) = share
         .connections
         .open_stream(endpoint, expected_peer)
         .await?;
