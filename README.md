@@ -11,7 +11,13 @@ Syncbox is a Rust command-line application for synchronizing multiple independen
 - Runtime status with heartbeat, lock, PID, and stale-process detection.
 - Local changes trigger a scan via filesystem notifications; a full scan still runs every 60 seconds
   to catch missed events. If watching fails, Syncbox falls back to scanning every 5 seconds.
-- Unfiltered direct QUIC candidates through Iroh N0 discovery, with port mapping, default best-path selection, and no relay fallback.
+- Unfiltered QUIC candidates through Iroh N0 discovery, with port mapping, automatic direct-path
+  selection, and N0 relay fallback. Connections are reused across synchronization rounds and shares;
+  each stream authenticates its share independently. Iroh prefers direct paths over relay paths and
+  selects by biased RTT, not measured file-transfer throughput.
+- Independent peer retry backoff with jitter and rotating candidate selection. Connection attempts
+  have a 20-second deadline, authentication a 10-second deadline, and each exchange a 5-minute limit.
+  Incoming connections without active streams are released after 90 seconds of application inactivity.
 - On Unix, POSIX permission bits for regular files and subdirectories are synchronized. Ownership,
   ACLs, extended attributes, and the selected shared-root directory's own mode remain local.
 - Symbolic links are synchronized as links on Unix and never followed while scanning. Following
