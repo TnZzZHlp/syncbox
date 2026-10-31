@@ -14,11 +14,10 @@ use tokio::{
 use tracing::{error, warn};
 
 use super::{
-    HANDSHAKE_TIMEOUT, MAX_INCOMING_HANDLERS,
-    client::sync_known_peers,
-    diagnostics,
+    HANDSHAKE_TIMEOUT, MAX_INCOMING_HANDLERS, diagnostics,
     incoming::handle_incoming,
     local::config_root,
+    peer_sessions::sync_known_peers,
     registry::ShareRegistry,
     run_blocking,
     scheduling::scan_due,
@@ -287,7 +286,7 @@ pub async fn run_sync_cycle(endpoint: &Endpoint, registry: &ShareRegistry) {
     }
 }
 
-pub async fn sync_active_share(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Result<()> {
+pub async fn scan_active_share(share: &Arc<ActiveShare>) -> Result<bool> {
     let config = share.config()?;
     if config.initial_sync_complete {
         let due = scan_due(
@@ -306,7 +305,13 @@ pub async fn sync_active_share(endpoint: &Endpoint, share: &Arc<ActiveShare>) ->
                 return Err(error);
             }
             *share.last_scan.lock().await = Some(Instant::now());
+            return Ok(true);
         }
     }
+    Ok(false)
+}
+
+pub async fn sync_active_share(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Result<()> {
+    scan_active_share(share).await?;
     sync_known_peers(endpoint, share).await.map(|_| ())
 }

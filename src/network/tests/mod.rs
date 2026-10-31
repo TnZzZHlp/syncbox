@@ -49,6 +49,7 @@ mod auth;
 mod connection_cache;
 mod lifecycle;
 mod local;
+mod peer_sessions;
 mod scheduling;
 mod state;
 mod transfer;

@@ -1,17 +1,14 @@
-use std::{
-    sync::{Arc, atomic::Ordering},
-    time::Instant,
-};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use iroh::{Endpoint, EndpointId};
 use rand::RngExt as _;
-use tokio::{io::AsyncWriteExt as _, sync::Semaphore, time::timeout};
-use tracing::{debug, info, warn};
+use tokio::{io::AsyncWriteExt as _, time::timeout};
+use tracing::info;
 
 use crate::{
     manifest::{Manifest, current_time_ms},
-    types::{PROTOCOL_VERSION, RuntimeState, SyncHealth},
+    types::PROTOCOL_VERSION,
 };
 
 use super::{
@@ -19,14 +16,8 @@ use super::{
     auth::{make_client_hello, read_server_hello, validate_server_hello},
     io::{IO_IDLE_TIMEOUT, ProgressIo},
     run_blocking,
-    scheduling::{
-        MAX_CONCURRENT_PEERS, PeerSyncOutcome, SyncOutcome, select_due_peers,
-        summarize_peer_outcomes,
-    },
-    state::{
-        ActiveShare, WINDOWS_SYMLINK_ERROR, known_peer_strings, merge_remote_peers, scan_and_save,
-        set_runtime_error, set_runtime_state, unsupported_symlink_count, update_runtime,
-    },
+    scheduling::PeerSyncOutcome,
+    state::{ActiveShare, known_peer_strings, merge_remote_peers, scan_and_save, update_runtime},
     transfer::{
         apply_remote_staged_transfer, make_transfer_request, receive_download_chunks,
         send_upload_chunks,
@@ -37,160 +28,6 @@ use super::{
         validate_transfer_ready, validate_transfer_response, write_json_frame,
     },
 };
-pub async fn sync_known_peers(
-    endpoint: &Endpoint,
-    share: &Arc<ActiveShare>,
-) -> Result<SyncOutcome> {
-    let peers = share.paths.load_known_peers(share.share_id)?;
-    let mut candidates = peers.endpoint_ids()?;
-    candidates.retain(|endpoint_id| *endpoint_id != share.local_endpoint_id);
-    if candidates.is_empty() {
-        debug!(share_id = %share.share_id, "no known peers available for synchronization");
-        set_runtime_state(
-            share,
-            RuntimeState::WaitingForPeers,
-            SyncHealth::Offline,
-            None,
-        )?;
-        return Ok(SyncOutcome::default());
-    }
-
-    let generation = share.manifest_generation.load(Ordering::Relaxed);
-    let network_generation = share.network_generation.load(Ordering::Acquire);
-    {
-        let mut schedules = share.peer_schedule.lock().await;
-        schedules.retain(|peer, _| candidates.contains(peer));
-        select_due_peers(&mut candidates, &schedules, Instant::now(), generation);
-        drop(schedules);
-    }
-    if candidates.is_empty() {
-        return Ok(SyncOutcome::default());
-    }
-    info!(
-        share_id = %share.share_id,
-        candidates = candidates.len(),
-        "starting synchronization with known peers"
-    );
-    set_runtime_state(
-        share,
-        RuntimeState::Synchronizing,
-        SyncHealth::Pending,
-        None,
-    )?;
-    let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_PEERS));
-    let mut tasks = tokio::task::JoinSet::new();
-    for peer in candidates {
-        let permit = permits
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("peer semaphore is never closed");
-        let endpoint = endpoint.clone();
-        let share = Arc::clone(share);
-        tasks.spawn(async move {
-            let _permit = permit;
-            info!(
-                share_id = %share.share_id,
-                peer_endpoint_id = %peer,
-                "starting peer synchronization"
-            );
-            let result = sync_with_peer(&endpoint, &share, peer).await;
-            let peer_outcome = result.as_ref().ok();
-            let outcome = peer_outcome.map(|outcome| SyncOutcome {
-                connected: true,
-                pending_downloads: outcome.pending_downloads,
-                pending_updates: outcome.pending_updates,
-                ..SyncOutcome::default()
-            });
-            share
-                .record_peer_attempt(peer, generation, network_generation, outcome.as_ref())
-                .await;
-            (peer, result)
-        });
-    }
-
-    let mut had_connection_error = false;
-    let mut synchronized = false;
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok((peer, Ok(peer_outcome))) => {
-                synchronized = true;
-                info!(
-                    share_id = %share.share_id,
-                    peer_endpoint_id = %peer,
-                    pending_downloads = peer_outcome.pending_downloads,
-                    pending_updates = peer_outcome.pending_updates,
-                    "peer synchronization completed"
-                );
-            }
-            Ok((peer, Err(error))) => {
-                had_connection_error = true;
-                warn!(
-                    share_id = %share.share_id,
-                    peer_endpoint_id = %peer,
-                    error = %format_args!("{error:#}"),
-                    "peer synchronization failed"
-                );
-                set_runtime_error(share, "could not connect to a known peer")?;
-            }
-            Err(error) => {
-                had_connection_error = true;
-                warn!(
-                    share_id = %share.share_id,
-                    error = %format_args!("{error:#}"),
-                    "peer synchronization task failed"
-                );
-                set_runtime_error(share, "could not connect to a known peer")?;
-            }
-        }
-    }
-    let mut outcome = {
-        let schedules = share.peer_schedule.lock().await;
-        summarize_peer_outcomes(&schedules)
-    };
-    outcome.unsupported_items = unsupported_symlink_count(&share.manifest_snapshot()?.manifest);
-    if outcome.connected {
-        let completely_synchronized = outcome.pending_downloads == 0
-            && outcome.pending_updates == 0
-            && outcome.unsupported_items == 0;
-        let (state, health) = if outcome.unsupported_items > 0 {
-            (RuntimeState::Degraded, SyncHealth::Error)
-        } else if completely_synchronized {
-            (RuntimeState::Running, SyncHealth::Synchronized)
-        } else {
-            (RuntimeState::Synchronizing, SyncHealth::Pending)
-        };
-        update_runtime(share, |status, now_ms| {
-            status.state = state;
-            status.health = health;
-            status.connected_peers = outcome.connected_peers;
-            status.pending_downloads = outcome.pending_downloads;
-            status.pending_updates = outcome.pending_updates;
-            if synchronized {
-                status.last_sync_at_ms = Some(now_ms);
-            }
-            status.last_error =
-                (outcome.unsupported_items > 0).then(|| WINDOWS_SYMLINK_ERROR.to_owned());
-        })?;
-    } else {
-        set_runtime_state(
-            share,
-            RuntimeState::WaitingForPeers,
-            SyncHealth::Offline,
-            had_connection_error.then_some("could not connect to a known peer"),
-        )?;
-    }
-    info!(
-        share_id = %share.share_id,
-        connected_peers = outcome.connected_peers,
-        pending_downloads = outcome.pending_downloads,
-        pending_updates = outcome.pending_updates,
-        unsupported_items = outcome.unsupported_items,
-        "synchronization with known peers finished"
-    );
-    Ok(outcome)
-}
-
 pub async fn sync_with_peer(
     endpoint: &Endpoint,
     share: &Arc<ActiveShare>,

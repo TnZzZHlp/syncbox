@@ -36,6 +36,7 @@ mod incoming;
 mod io;
 mod lifecycle;
 mod local;
+mod peer_sessions;
 mod registry;
 mod scheduling;
 mod state;

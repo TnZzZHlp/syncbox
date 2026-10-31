@@ -19,7 +19,7 @@ use crate::{
 };
 
 use super::{
-    client::sync_known_peers,
+    peer_sessions::sync_known_peers,
     scheduling::initial_sync_status,
     state::{ActiveShare, set_runtime_state, set_stopped},
     transport::{ConnectionPool, bind_endpoint},

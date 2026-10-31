@@ -16,8 +16,9 @@ Syncbox is a Rust command-line application for synchronizing multiple independen
   each stream authenticates its share independently. Iroh prefers direct paths over relay paths and
   selects by biased RTT, not measured file-transfer throughput. The outgoing pool holds at most
   32 peers and evicts only unused connections; active streams retain connection leases.
-- Shares run independent outbound synchronization loops, with at most four share cycles active at
-  once. A slow share does not delay the next scan or retry cycle of others with available capacity.
+- Each share scans and schedules peers independently. Scans are limited to four concurrent shares;
+  outbound peer sessions are limited to eight globally and two per share. A slow peer does not block
+  local scans or another peer's next exchange when a session slot is available.
 - Independent peer retry backoff with jitter and rotating candidate selection. Connection attempts
   have a 20-second deadline and authentication a 10-second deadline. Blocked network reads and writes
   time out after 60 seconds without progress, rather than imposing a fixed total transfer duration.
