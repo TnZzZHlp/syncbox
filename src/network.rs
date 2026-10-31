@@ -1854,10 +1854,12 @@ async fn send_file_chunks_from_root<W: tokio::io::AsyncWrite + Unpin>(
         let mut source = tokio::fs::File::open(&target)
             .await
             .with_context(|| format!("unable to open shared file {}", target.display()))?;
-        source
-            .seek(std::io::SeekFrom::Start(file.offset))
-            .await
-            .with_context(|| format!("unable to seek shared file {}", target.display()))?;
+        if file.offset != 0 {
+            source
+                .seek(std::io::SeekFrom::Start(file.offset))
+                .await
+                .with_context(|| format!("unable to seek shared file {}", target.display()))?;
+        }
         let required = usize::try_from(
             file.size
                 .saturating_sub(file.offset)
@@ -2001,10 +2003,14 @@ async fn receive_file_chunks<R: tokio::io::AsyncRead + Unpin>(
         let destination = ensure_partial_file(&partial, file.offset)
             .with_context(|| format!("unable to prepare transfer for {}", file.path))?;
         let mut destination = tokio::fs::File::from_std(destination);
-        destination
-            .seek(std::io::SeekFrom::Start(file.offset))
-            .await
-            .with_context(|| format!("unable to seek transfer partial {}", partial.display()))?;
+        if file.offset != 0 {
+            destination
+                .seek(std::io::SeekFrom::Start(file.offset))
+                .await
+                .with_context(|| {
+                    format!("unable to seek transfer partial {}", partial.display())
+                })?;
+        }
         let mut offset = file.offset;
         while offset < file.size {
             let count = read_chunk(recv, file_index, offset, file.size - offset, &mut data).await?;
