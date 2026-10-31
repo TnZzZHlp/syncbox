@@ -20,9 +20,9 @@ Syncbox is a Rust command-line application for synchronizing multiple independen
 
 ## Upgrades
 
-Protocol version 5 peers do not communicate with version 4 peers. Version 5 compares compact
-manifest digests before sending full manifests; version 4 removed a duplicate manifest from
-transfer requests. Upgrade every peer in a share as one maintenance operation: stop the services,
+Protocol version 6 peers do not communicate with earlier protocol versions. Version 6 sends
+file chunks as bounded binary frames instead of base64 JSON. Version 5 introduced compact
+manifest digests before full manifest exchange. Upgrade every peer in a share as one maintenance operation: stop the services,
 install the same version everywhere, then start them again.
 
 ## Quick start
@@ -91,7 +91,12 @@ CROSS_CONTAINER_ENGINE=podman cross build --release --target x86_64-pc-windows-g
 
 ## Current transfer limits
 
-The current protocol streams file contents in 1 MiB chunks and no longer imposes the former 16 MiB per-file or 64 MiB per-exchange limits. Each exchange handles up to 256 files, with additional files left pending, and control frames are capped at 96 MiB.
+The current protocol streams file contents in binary chunks of up to 1 MiB, each prefixed by a
+16-byte big-endian header: file index (u32, in the agreed transfer list), offset (u64), and payload
+length (u32). Receivers validate the header before allocating payload storage and verify each
+completed file against its SHA-256, including resumed files. There are no per-file or per-exchange
+byte limits. Each exchange handles up to 256 files, with additional files left pending, and JSON
+control frames are capped at 96 MiB.
 
 ## License
 

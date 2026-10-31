@@ -24,7 +24,15 @@ serde_json = "1.0"
 sha2 = "0.11"
 subtle = "2.6"
 thiserror = "2.0"
-tokio = { version = "1.49", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "time", "sync"] }
+tokio = { version = "1.49", features = [
+  "fs",
+  "io-util",
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "time",
+  "sync",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2.5"
@@ -36,3 +44,26 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 assert_cmd = "2.1"
 predicates = "3.1"
 tempfile = "3.24"
+
+[lints]
+workspace = true
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+style = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+all = { level = "warn", priority = -1 }
+
+cargo_common_metadata = "allow"
+multiple_crate_versions = "allow"
+missing_errors_doc = "allow"
+similar_names = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"

@@ -743,7 +743,7 @@ fn determine_share_name(local_directory: &Path, requested_name: Option<&str>) ->
 }
 
 #[cfg(windows)]
-fn unsupported_symlink_count(manifest: &Manifest) -> usize {
+const fn unsupported_symlink_count(manifest: &Manifest) -> usize {
     manifest.symlinks.len()
 }
 
@@ -827,7 +827,7 @@ fn process_alive(process_id: u32) -> bool {
 
 #[cfg(not(target_os = "linux"))]
 #[allow(clippy::unnecessary_wraps)]
-fn process_alive(process_id: u32) -> bool {
+const fn process_alive(process_id: u32) -> bool {
     if process_id == 0 {
         false
     } else {

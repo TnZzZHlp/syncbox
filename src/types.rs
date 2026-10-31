@@ -7,9 +7,7 @@ use rand::RngExt as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 pub const FORMAT_VERSION: u16 = 1;
-/// Wire format used after peer authentication. Version 5 adds digest-first manifest negotiation;
-/// version 4 removed the duplicate manifest from transfer requests.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 /// `ShareTickets` only carry credentials and peer addresses. Their version remains stable across
 /// wire-protocol upgrades so an existing ticket can still be used after both peers upgrade.
 pub const TICKET_PROTOCOL_VERSION: u16 = 1;
@@ -372,7 +370,7 @@ impl fmt::Display for SyncHealth {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeStatus {
     pub format_version: u16,

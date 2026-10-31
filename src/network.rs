@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::Read,
@@ -32,11 +33,14 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    chunk::{MAX_CHUNK_BYTES, read_chunk, write_chunk},
+    frame,
     identity::DeviceIdentity,
     manifest::{
         Manifest, ManifestRecordRef, current_time_ms, path_for_manifest, scan_manifest,
         select_record, validate_manifest_path,
     },
+    runtime::RuntimeStatusCache,
     storage::DataPaths,
     types::{
         PROTOCOL_VERSION, RuntimeState, RuntimeStatus, ShareConfig, ShareId, SyncHealth,
@@ -49,8 +53,8 @@ const AUTH_MAGIC: [u8; 4] = *b"SBXA";
 const CLIENT_HELLO_LENGTH: usize = 4 + 2 + 32 + 32 + 32 + 32;
 const SERVER_HELLO_LENGTH: usize = 4 + 2 + 32 + 32 + 32 + 32 + 32;
 const MAX_CONTROL_FRAME_BYTES: usize = 96 * 1024 * 1024;
-const TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_TRANSFER_FILES: usize = 256;
+const HASH_BUFFER_BYTES: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const SYNC_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -89,7 +93,7 @@ struct ActiveShare {
     config: Arc<RwLock<ShareConfig>>,
     receive_lock: Arc<Mutex<()>>,
     operation_lock: Arc<Mutex<()>>,
-    status_lock: Arc<std::sync::Mutex<()>>,
+    runtime_status: Arc<std::sync::Mutex<RuntimeStatusCache>>,
     manifest_generation: Arc<AtomicU64>,
     manifest_cache: Arc<std::sync::Mutex<Option<Arc<ManifestSnapshot>>>>,
     peer_schedule: Arc<Mutex<PeerSchedule>>,
@@ -461,7 +465,7 @@ fn load_registry(
                 config: Arc::new(RwLock::new(config)),
                 receive_lock: Arc::new(Mutex::new(())),
                 operation_lock: Arc::new(Mutex::new(())),
-                status_lock: Arc::new(std::sync::Mutex::new(())),
+                runtime_status: Arc::new(std::sync::Mutex::new(RuntimeStatusCache::default())),
                 manifest_generation: Arc::new(AtomicU64::new(0)),
                 manifest_cache: Arc::new(std::sync::Mutex::new(None)),
                 peer_schedule: Arc::new(Mutex::new(PeerSchedule::default())),
@@ -768,7 +772,7 @@ struct ApplyOutcome {
 }
 
 #[cfg(windows)]
-fn unsupported_symlink_count(manifest: &Manifest) -> usize {
+const fn unsupported_symlink_count(manifest: &Manifest) -> usize {
     manifest.symlinks.len()
 }
 
@@ -1031,10 +1035,10 @@ async fn sync_with_peer(
         });
     }
 
-    let outbound_manifest = outbound_snapshot.map_or_else(
-        || Manifest::empty(share.share_id, current_time_ms()),
-        |snapshot| snapshot.manifest.clone(),
-    );
+    let empty_manifest = Manifest::empty(share.share_id, current_time_ms());
+    let outbound_manifest = outbound_snapshot
+        .as_ref()
+        .map_or(&empty_manifest, |snapshot| &snapshot.manifest);
     info!(
         share_id = %share.share_id,
         peer_endpoint_id = %expected_peer,
@@ -1064,7 +1068,7 @@ async fn sync_with_peer(
 
     let (transfer, pending_updates) = {
         let _operation_lock = share.operation_lock.lock().await;
-        make_transfer_request(share, &outbound_message.manifest, &remote_message.manifest)?
+        make_transfer_request(share, outbound_message.manifest, &remote_message.manifest)?
     };
     info!(
         share_id = %share.share_id,
@@ -1237,7 +1241,7 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
     let local_message = ManifestMessage {
         protocol_version: PROTOCOL_VERSION,
         share_id: share.share_id,
-        manifest: local_manifest.manifest.clone(),
+        manifest: &local_manifest.manifest,
     };
     write_json_frame(&mut send, &local_message).await?;
     info!(
@@ -1298,8 +1302,8 @@ async fn handle_incoming(connection: Connection, registry: ShareRegistry) -> Res
         &TransferResponse {
             protocol_version: PROTOCOL_VERSION,
             share_id: share.share_id,
-            manifest: final_manifest.manifest.clone(),
-            files: files.clone(),
+            manifest: &final_manifest.manifest,
+            files: &files,
         },
     )
     .await?;
@@ -1349,10 +1353,10 @@ struct SyncResponse {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ManifestMessage {
+struct ManifestMessage<M = Manifest> {
     protocol_version: u16,
     share_id: ShareId,
-    manifest: Manifest,
+    manifest: M,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1375,11 +1379,11 @@ struct TransferReady {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TransferResponse {
+struct TransferResponse<M = Manifest, F = Vec<TransferFile>> {
     protocol_version: u16,
     share_id: ShareId,
-    manifest: Manifest,
-    files: Vec<TransferFile>,
+    manifest: M,
+    files: F,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1389,23 +1393,6 @@ struct TransferFile {
     sha256: String,
     size: u64,
     offset: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ChunkFrame {
-    path: String,
-    sha256: String,
-    offset: u64,
-    content: String,
-}
-
-#[derive(Serialize)]
-struct OutgoingChunkFrame<'a> {
-    path: &'a str,
-    sha256: &'a str,
-    offset: u64,
-    content: &'a str,
 }
 
 #[allow(dead_code)]
@@ -1624,15 +1611,14 @@ fn make_transfer_request(
                     size: remote_entry.size,
                     offset: partial_size(share, path, &remote_entry.sha256, remote_entry.size)?,
                 });
+                if download_paths.len() == MAX_TRANSFER_FILES {
+                    break;
+                }
             }
         }
     }
-    download_paths.sort_unstable();
-    download_paths.dedup();
-    download_paths.truncate(MAX_TRANSFER_FILES);
-    download_resumes.retain(|file| download_paths.binary_search(&file.path).is_ok());
-
-    let mut upload_paths = Vec::new();
+    let mut uploads = Vec::new();
+    let mut requested_uploads = 0_usize;
     for (path, local_entry) in &local.entries {
         let local_record = ManifestRecordRef::File(local_entry);
         let selected = select_record(Some(local_record), remote.record(path));
@@ -1641,23 +1627,17 @@ fn make_transfer_request(
             entry.size == local_entry.size && entry.sha256 == local_entry.sha256
         });
         if local_wins && !remote_content_matches {
-            upload_paths.push(path.clone());
+            requested_uploads += 1;
+            if uploads.len() < MAX_TRANSFER_FILES {
+                uploads.push(TransferFile {
+                    path: path.clone(),
+                    sha256: local_entry.sha256.clone(),
+                    size: local_entry.size,
+                    offset: 0,
+                });
+            }
         }
     }
-    upload_paths.sort_unstable();
-    let requested_uploads = upload_paths.len();
-    upload_paths.truncate(MAX_TRANSFER_FILES);
-    let uploads = upload_paths
-        .iter()
-        .filter_map(|path| {
-            local.entries.get(path).map(|entry| TransferFile {
-                path: path.clone(),
-                sha256: entry.sha256.clone(),
-                size: entry.size,
-                offset: 0,
-            })
-        })
-        .collect::<Vec<_>>();
     let pending_updates = requested_uploads.saturating_sub(uploads.len());
     Ok((
         TransferRequest {
@@ -1843,16 +1823,16 @@ async fn send_upload_chunks(
     send_file_chunks_from_root(share, peer_endpoint_id, ready, send).await
 }
 
-async fn send_file_chunks_from_root(
+async fn send_file_chunks_from_root<W: tokio::io::AsyncWrite + Unpin>(
     share: &Arc<ActiveShare>,
     peer_endpoint_id: EndpointId,
     files: &[TransferFile],
-    send: &mut SendStream,
+    send: &mut W,
 ) -> Result<()> {
     let root = config_root(&share.config()?)?;
-    let mut buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
-    let mut content = String::new();
-    for file in files {
+    let mut buffer = Vec::new();
+    for (file_index, file) in files.iter().enumerate() {
+        let file_index = u32::try_from(file_index).context("transfer file index overflow")?;
         debug!(
             share_id = %share.share_id,
             peer_endpoint_id = %peer_endpoint_id,
@@ -1877,6 +1857,19 @@ async fn send_file_chunks_from_root(
             .seek(std::io::SeekFrom::Start(file.offset))
             .await
             .with_context(|| format!("unable to seek shared file {}", target.display()))?;
+        let required = usize::try_from(
+            file.size
+                .saturating_sub(file.offset)
+                .min(MAX_CHUNK_BYTES as u64),
+        )
+        .context("transfer chunk size does not fit this platform")?;
+        if buffer.len() < required {
+            if buffer.is_empty() {
+                buffer = vec![0_u8; required];
+            } else {
+                buffer.resize(required, 0);
+            }
+        }
         let mut offset = file.offset;
         while offset < file.size {
             let wanted = usize::try_from((file.size - offset).min(buffer.len() as u64))
@@ -1891,18 +1884,7 @@ async fn send_file_chunks_from_root(
                     target.display()
                 );
             }
-            content.clear();
-            URL_SAFE_NO_PAD.encode_string(&buffer[..count], &mut content);
-            write_json_frame(
-                send,
-                &OutgoingChunkFrame {
-                    path: &file.path,
-                    sha256: &file.sha256,
-                    offset,
-                    content: &content,
-                },
-            )
-            .await?;
+            write_chunk(send, file_index, offset, &buffer[..count]).await?;
             offset += count as u64;
         }
         let after = fs::symlink_metadata(&target)
@@ -1959,7 +1941,7 @@ fn ensure_partial_file(path: &Path, offset: u64) -> Result<fs::File> {
         .with_context(|| format!("unable to open transfer partial {}", path.display()))
 }
 
-fn verify_partial(path: &Path, file: &TransferFile) -> Result<()> {
+fn verify_partial(path: &Path, file: &TransferFile, buffer: &mut Vec<u8>) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("unable to inspect transfer partial {}", path.display()))?;
     if !metadata.is_file() || metadata.len() != file.size {
@@ -1968,10 +1950,12 @@ fn verify_partial(path: &Path, file: &TransferFile) -> Result<()> {
     let mut source = fs::File::open(path)
         .with_context(|| format!("unable to open transfer partial {}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 64 * 1024];
+    if buffer.len() < HASH_BUFFER_BYTES {
+        buffer.resize(HASH_BUFFER_BYTES, 0);
+    }
     loop {
         let count = source
-            .read(&mut buffer)
+            .read(&mut buffer[..HASH_BUFFER_BYTES])
             .with_context(|| format!("unable to read transfer partial {}", path.display()))?;
         if count == 0 {
             break;
@@ -1993,17 +1977,17 @@ fn verify_partial(path: &Path, file: &TransferFile) -> Result<()> {
     Ok(())
 }
 
-async fn receive_file_chunks(
+async fn receive_file_chunks<R: tokio::io::AsyncRead + Unpin>(
     share: &Arc<ActiveShare>,
     peer_endpoint_id: EndpointId,
     files: &[TransferFile],
-    recv: &mut RecvStream,
+    recv: &mut R,
 ) -> Result<Vec<CompletedFile>> {
     validate_transfer_file_shapes(files)?;
     let mut completed = Vec::new();
-    let mut data = Vec::with_capacity(TRANSFER_CHUNK_BYTES);
-    let mut canonical = String::new();
-    for file in files {
+    let mut data = Vec::new();
+    for (file_index, file) in files.iter().enumerate() {
+        let file_index = u32::try_from(file_index).context("transfer file index overflow")?;
         debug!(
             share_id = %share.share_id,
             peer_endpoint_id = %peer_endpoint_id,
@@ -2022,34 +2006,21 @@ async fn receive_file_chunks(
             .with_context(|| format!("unable to seek transfer partial {}", partial.display()))?;
         let mut offset = file.offset;
         while offset < file.size {
-            let frame: ChunkFrame = read_json_frame(recv).await?;
-            if frame.path != file.path || frame.sha256 != file.sha256 || frame.offset != offset {
-                bail!("chunk frame does not match the requested transfer");
-            }
-            data.clear();
-            URL_SAFE_NO_PAD
-                .decode_vec(&frame.content, &mut data)
-                .map_err(|_| anyhow!("chunk frame payload is not valid base64url"))?;
-            canonical.clear();
-            URL_SAFE_NO_PAD.encode_string(&data, &mut canonical);
-            if canonical != frame.content
-                || data.is_empty()
-                || data.len() > TRANSFER_CHUNK_BYTES
-                || offset.saturating_add(data.len() as u64) > file.size
-            {
-                bail!("chunk frame has an invalid payload length");
-            }
-            destination.write_all(&data).await.with_context(|| {
-                format!("unable to write transfer partial {}", partial.display())
-            })?;
-            offset += data.len() as u64;
+            let count = read_chunk(recv, file_index, offset, file.size - offset, &mut data).await?;
+            destination
+                .write_all(&data[..count])
+                .await
+                .with_context(|| {
+                    format!("unable to write transfer partial {}", partial.display())
+                })?;
+            offset += count as u64;
         }
         destination
             .sync_all()
             .await
             .with_context(|| format!("unable to flush transfer partial {}", partial.display()))?;
         drop(destination);
-        run_blocking(|| verify_partial(&partial, file))?;
+        run_blocking(|| verify_partial(&partial, file, &mut data))?;
         completed.push(CompletedFile {
             file: file.clone(),
             staged_path: partial,
@@ -2161,28 +2132,23 @@ fn apply_remote_transfer_impl(
     let local_snapshot = share.manifest_snapshot()?;
     let local = &local_snapshot.manifest;
 
-    let mut candidate = local.clone();
+    let mut candidate = Cow::Borrowed(local);
+    let mut hash_buffer = Vec::new();
     let mut pending_downloads = 0_usize;
     let mut applied_records = 0_usize;
-    let mut all_paths = local
-        .all_paths()
-        .union(&remote.all_paths())
-        .cloned()
+    let mut all_paths = remote
+        .paths()
+        .filter(|path| remote_record_wins(local.record(path), remote.record(path)))
         .collect::<Vec<_>>();
     all_paths.sort_by(|left, right| {
         manifest_path_depth(right)
             .cmp(&manifest_path_depth(left))
             .then_with(|| right.cmp(left))
     });
-    for path in &all_paths {
-        let local_record = local.record(path);
-        let remote_record = remote.record(path);
-        let selected_remote = remote_record_wins(local_record, remote_record);
-        if !selected_remote {
-            continue;
-        }
-        if let Some(ManifestRecordRef::Tombstone(tombstone)) = remote_record {
+    for &path in &all_paths {
+        if let Some(ManifestRecordRef::Tombstone(tombstone)) = remote.record(path) {
             remove_local_path(&root, path)?;
+            let candidate = candidate.to_mut();
             candidate.entries.remove(path);
             candidate.directories.remove(path);
             candidate.symlinks.remove(path);
@@ -2193,14 +2159,10 @@ fn apply_remote_transfer_impl(
 
     all_paths.sort_unstable();
     let mut directory_permissions = Vec::new();
-    for path in &all_paths {
-        let local_record = local.record(path);
-        let remote_record = remote.record(path);
-        if !remote_record_wins(local_record, remote_record) {
-            continue;
-        }
-        if let Some(ManifestRecordRef::Directory(entry)) = remote_record {
+    for &path in &all_paths {
+        if let Some(ManifestRecordRef::Directory(entry)) = remote.record(path) {
             ensure_local_directory(&root, path)?;
+            let candidate = candidate.to_mut();
             candidate.entries.remove(path);
             candidate.symlinks.remove(path);
             candidate.tombstones.remove(path);
@@ -2210,14 +2172,10 @@ fn apply_remote_transfer_impl(
         }
     }
 
-    for path in &all_paths {
-        let local_record = local.record(path);
-        let remote_record = remote.record(path);
-        if !remote_record_wins(local_record, remote_record) {
-            continue;
-        }
-        if let Some(ManifestRecordRef::Symlink(entry)) = remote_record {
+    for &path in &all_paths {
+        if let Some(ManifestRecordRef::Symlink(entry)) = remote.record(path) {
             write_local_symlink(share, &root, path, &entry.target)?;
+            let candidate = candidate.to_mut();
             candidate.entries.remove(path);
             candidate.directories.remove(path);
             candidate.tombstones.remove(path);
@@ -2226,13 +2184,8 @@ fn apply_remote_transfer_impl(
         }
     }
 
-    for path in &all_paths {
-        let local_record = local.record(path);
-        let remote_record = remote.record(path);
-        if !remote_record_wins(local_record, remote_record) {
-            continue;
-        }
-        if let Some(ManifestRecordRef::File(entry)) = remote_record {
+    for &path in &all_paths {
+        if let Some(ManifestRecordRef::File(entry)) = remote.record(path) {
             if let Some(incoming) = file_data.get(path) {
                 match incoming {
                     IncomingFile::Bytes(bytes) => {
@@ -2242,6 +2195,7 @@ fn apply_remote_transfer_impl(
                         write_local_staged_file(&root, path, staged_path, entry.permissions)?;
                     }
                 }
+                let candidate = candidate.to_mut();
                 candidate.directories.remove(path);
                 candidate.entries.remove(path);
                 candidate.tombstones.remove(path);
@@ -2256,9 +2210,16 @@ fn apply_remote_transfer_impl(
                     local_entry.size == entry.size && local_entry.sha256 == entry.sha256
                 });
                 if local_content_matches
-                    && local_file_matches_entry(&root, path, entry.size, &entry.sha256)?
+                    && local_file_matches_entry(
+                        &root,
+                        path,
+                        entry.size,
+                        &entry.sha256,
+                        &mut hash_buffer,
+                    )?
                 {
                     set_local_file_permissions(&root, path, entry.permissions)?;
+                    let candidate = candidate.to_mut();
                     candidate.directories.remove(path);
                     candidate.tombstones.remove(path);
                     candidate.entries.insert(path.clone(), entry.clone());
@@ -2280,16 +2241,18 @@ fn apply_remote_transfer_impl(
     for (path, permissions) in directory_permissions {
         set_local_directory_permissions(&root, &path, permissions)?;
     }
-    candidate.scanned_at_ms = current_time_ms();
-    candidate.validate(share.share_id)?;
     let unsupported_items = unsupported_symlink_count(&candidate);
-    if candidate.entries != local.entries
-        || candidate.directories != local.directories
-        || candidate.symlinks != local.symlinks
-        || candidate.tombstones != local.tombstones
-    {
-        observe_manifest_clock(share, &candidate)?;
-        share.save_manifest(candidate)?;
+    if let Cow::Owned(mut candidate) = candidate {
+        candidate.scanned_at_ms = current_time_ms();
+        candidate.validate(share.share_id)?;
+        if candidate.entries != local.entries
+            || candidate.directories != local.directories
+            || candidate.symlinks != local.symlinks
+            || candidate.tombstones != local.tombstones
+        {
+            observe_manifest_clock(share, &candidate)?;
+            share.save_manifest(candidate)?;
+        }
     }
     debug!(
         share_id = %share.share_id,
@@ -2498,6 +2461,7 @@ fn local_file_matches_entry(
     manifest_path: &str,
     expected_size: u64,
     expected_sha256: &str,
+    buffer: &mut Vec<u8>,
 ) -> Result<bool> {
     with_writable_parents(root, manifest_path, false, || {
         let target = safe_local_path(root, manifest_path, false)?;
@@ -2519,10 +2483,12 @@ fn local_file_matches_entry(
             let mut file = fs::File::open(&target)
                 .with_context(|| format!("unable to read shared file {}", target.display()))?;
             let mut hasher = Sha256::new();
-            let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+            if buffer.len() < HASH_BUFFER_BYTES {
+                buffer.resize(HASH_BUFFER_BYTES, 0);
+            }
             loop {
                 let count = file
-                    .read(&mut buffer)
+                    .read(&mut buffer[..HASH_BUFFER_BYTES])
                     .with_context(|| format!("unable to read shared file {}", target.display()))?;
                 if count == 0 {
                     break;
@@ -3009,7 +2975,8 @@ fn set_permissions(target: &Path, permissions: u16, directory: bool) -> Result<(
 }
 
 #[cfg(not(unix))]
-fn set_permissions(_target: &Path, _permissions: u16, _directory: bool) -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+const fn set_permissions(_target: &Path, _permissions: u16, _directory: bool) -> Result<()> {
     Ok(())
 }
 
@@ -3090,22 +3057,17 @@ fn update_runtime<F>(share: &Arc<ActiveShare>, update: F) -> Result<()>
 where
     F: FnOnce(&mut RuntimeStatus, u64),
 {
-    let _status_lock = share
-        .status_lock
+    share
+        .runtime_status
         .lock()
-        .map_err(|_| anyhow!("runtime status lock was poisoned"))?;
-    let now_ms = current_time_ms();
-    let mut status = share
-        .paths
-        .load_runtime_status(share.share_id)?
-        .unwrap_or_else(|| RuntimeStatus::stopped(now_ms));
-    if status.process_id == 0 {
-        status.process_id = std::process::id();
-        status.started_at_ms = now_ms;
-    }
-    status.heartbeat_at_ms = now_ms;
-    update(&mut status, now_ms);
-    share.paths.save_runtime_status(share.share_id, &status)
+        .map_err(|_| anyhow!("runtime status lock was poisoned"))?
+        .update(
+            &share.paths,
+            share.share_id,
+            current_time_ms(),
+            false,
+            update,
+        )
 }
 
 fn set_runtime_state(
@@ -3132,7 +3094,17 @@ fn set_runtime_error(share: &Arc<ActiveShare>, message: &str) -> Result<()> {
 }
 
 fn refresh_heartbeat(share: &Arc<ActiveShare>) -> Result<()> {
-    update_runtime(share, |_, _| {})
+    share
+        .runtime_status
+        .lock()
+        .map_err(|_| anyhow!("runtime status lock was poisoned"))?
+        .update(
+            &share.paths,
+            share.share_id,
+            current_time_ms(),
+            true,
+            |_, _| {},
+        )
 }
 
 fn set_stopped(share: &Arc<ActiveShare>) -> Result<()> {
@@ -3359,38 +3331,11 @@ fn take<const N: usize>(source: &[u8], cursor: &mut usize) -> Result<[u8; N]> {
 }
 
 async fn write_json_frame<T: Serialize + Sync>(send: &mut SendStream, value: &T) -> Result<()> {
-    let payload = serde_json::to_vec(value).context("unable to serialize sync protocol message")?;
-    if payload.len() > MAX_CONTROL_FRAME_BYTES {
-        bail!("sync protocol message exceeds its maximum size");
-    }
-    let length: u32 = payload
-        .len()
-        .try_into()
-        .map_err(|_| anyhow!("sync protocol message is too large"))?;
-    send.write_all(&length.to_be_bytes())
-        .await
-        .context("unable to write sync protocol frame length")?;
-    send.write_all(&payload)
-        .await
-        .context("unable to write sync protocol frame")?;
-    Ok(())
+    frame::write_json(send, value, MAX_CONTROL_FRAME_BYTES).await
 }
 
 async fn read_json_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
-    let mut length_bytes = [0_u8; 4];
-    recv.read_exact(&mut length_bytes)
-        .await
-        .context("unable to read sync protocol frame length")?;
-    let length = usize::try_from(u32::from_be_bytes(length_bytes))
-        .map_err(|_| anyhow!("sync protocol frame length overflow"))?;
-    if length > MAX_CONTROL_FRAME_BYTES {
-        bail!("sync protocol frame exceeds its maximum size");
-    }
-    let mut bytes = vec![0_u8; length];
-    recv.read_exact(&mut bytes)
-        .await
-        .context("unable to read sync protocol frame")?;
-    serde_json::from_slice(&bytes).context("unable to parse sync protocol frame")
+    frame::read_json(recv, MAX_CONTROL_FRAME_BYTES).await
 }
 
 #[cfg(test)]
@@ -3712,6 +3657,113 @@ mod tests {
         assert_eq!(chunk_ranges(10, 4, 3), vec![(4, 3), (7, 3), (10, 0)]);
     }
 
+    #[test]
+    fn download_resume_checks_are_limited_to_the_selected_batch() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+        let share_id = ShareId([64; 32]);
+        let endpoint = SecretKey::from_bytes(&[65; 32]).public();
+        let mut local = Manifest::empty(share_id, 1);
+        let share = active_share(&root, local.clone(), endpoint);
+        let mut remote = Manifest::empty(share_id, 2);
+        for index in 0..=MAX_TRANSFER_FILES {
+            remote.entries.insert(
+                format!("file-{index:03}"),
+                ManifestEntry {
+                    size: 1,
+                    modified_at_ns: 0,
+                    sha256: "a".repeat(64),
+                    permissions: None,
+                    version: timestamp(2, endpoint),
+                },
+            );
+        }
+        let (deferred_path, deferred) = remote.entries.last_key_value().unwrap();
+        fs::create_dir(partial_path(&share, deferred_path, &deferred.sha256)).unwrap();
+        let (request, _) = make_transfer_request(&share, &local, &remote).unwrap();
+        assert_eq!(request.download_paths.len(), MAX_TRANSFER_FILES);
+        assert_eq!(request.download_paths.first().unwrap(), "file-000");
+        assert_eq!(request.download_paths.last().unwrap(), "file-255");
+        for path in request.download_paths {
+            local
+                .entries
+                .insert(path.clone(), remote.entries[&path].clone());
+        }
+        let error = make_transfer_request(&share, &local, &remote)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn capped_uploads_keep_the_remaining_update_count() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+        let share_id = ShareId([66; 32]);
+        let endpoint = SecretKey::from_bytes(&[67; 32]).public();
+        let mut local = Manifest::empty(share_id, 1);
+        let remote = Manifest::empty(share_id, 2);
+        let share = active_share(&root, local.clone(), endpoint);
+        for index in 0..=MAX_TRANSFER_FILES {
+            local.entries.insert(
+                format!("file-{index:03}"),
+                ManifestEntry {
+                    size: 1,
+                    modified_at_ns: 0,
+                    sha256: "a".repeat(64),
+                    permissions: None,
+                    version: timestamp(2, endpoint),
+                },
+            );
+        }
+        let (request, pending) = make_transfer_request(&share, &local, &remote).unwrap();
+        assert_eq!(request.uploads.len(), MAX_TRANSFER_FILES);
+        assert_eq!(pending, 1);
+    }
+
+    #[test]
+    fn stale_remote_files_are_not_counted_as_pending_downloads() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("share");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("newer"), b"keep").unwrap();
+        let share_id = ShareId([68; 32]);
+        let endpoint = SecretKey::from_bytes(&[69; 32]).public();
+        let mut local = Manifest::empty(share_id, 1);
+        local.entries.insert(
+            "newer".to_owned(),
+            ManifestEntry {
+                size: 4,
+                modified_at_ns: 0,
+                sha256: hex::encode(Sha256::digest(b"keep")),
+                permissions: None,
+                version: timestamp(3, endpoint),
+            },
+        );
+        let share = active_share(&root, local.clone(), endpoint);
+        let mut remote = local.clone();
+        remote.entries.get_mut("newer").unwrap().version = timestamp(2, endpoint);
+        remote.entries.insert(
+            "missing".to_owned(),
+            ManifestEntry {
+                size: 1,
+                modified_at_ns: 0,
+                sha256: hex::encode(Sha256::digest(b"x")),
+                permissions: None,
+                version: timestamp(4, endpoint),
+            },
+        );
+        let outcome = apply_remote_transfer(&share, &remote, &[]).unwrap();
+        assert_eq!(outcome.pending_downloads, 1);
+        assert_eq!(
+            share.paths.load_manifest(share_id).unwrap().entries,
+            local.entries
+        );
+        assert_eq!(fs::read(root.join("newer")).unwrap(), b"keep");
+    }
+
     #[cfg(unix)]
     #[test]
     fn transfer_descriptors_accept_files_larger_than_sixteen_mib() {
@@ -3881,7 +3933,7 @@ mod tests {
             config: Arc::new(RwLock::new(config)),
             receive_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(Mutex::new(())),
-            status_lock: Arc::new(std::sync::Mutex::new(())),
+            runtime_status: Arc::new(std::sync::Mutex::new(RuntimeStatusCache::default())),
             manifest_generation: Arc::new(AtomicU64::new(0)),
             manifest_cache: Arc::new(std::sync::Mutex::new(None)),
             peer_schedule: Arc::new(Mutex::new(PeerSchedule::default())),
@@ -3985,6 +4037,63 @@ mod tests {
         (fs::metadata(path).unwrap().permissions().mode() & 0o7777) as u16
     }
 
+    #[tokio::test]
+    async fn binary_file_transfer_resumes_and_verifies_staged_files() {
+        let source_dir = TempDir::new().unwrap();
+        let destination_dir = TempDir::new().unwrap();
+        let source_root = source_dir.path().join("share");
+        let destination_root = destination_dir.path().join("share");
+        fs::create_dir(&source_root).unwrap();
+        fs::create_dir(&destination_root).unwrap();
+        let share_id = ShareId([61; 32]);
+        let sender_id = SecretKey::from_bytes(&[62; 32]).public();
+        let receiver_id = SecretKey::from_bytes(&[63; 32]).public();
+        let source = active_share(&source_root, Manifest::empty(share_id, 0), sender_id);
+        let destination =
+            active_share(&destination_root, Manifest::empty(share_id, 0), receiver_id);
+        let payload = vec![0xa5; MAX_CHUNK_BYTES + 1000];
+        let contents = [
+            ("large", payload.as_slice()),
+            ("empty", b""),
+            ("resumed", b"resume"),
+            ("last", b"last"),
+        ];
+        let files = contents
+            .iter()
+            .map(|(name, bytes)| {
+                fs::write(source_root.join(name), bytes).unwrap();
+                TransferFile {
+                    path: (*name).to_owned(),
+                    sha256: hex::encode(Sha256::digest(bytes)),
+                    size: bytes.len() as u64,
+                    offset: match *name {
+                        "large" => 73,
+                        "resumed" => bytes.len() as u64,
+                        _ => 0,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        let partial = partial_path(&destination, &files[0].path, &files[0].sha256);
+        fs::write(&partial, &payload[..73]).unwrap();
+        fs::write(
+            partial_path(&destination, &files[2].path, &files[2].sha256),
+            b"resume",
+        )
+        .unwrap();
+        let (mut send, mut recv) = tokio::io::duplex(4096);
+        let (sent, received) = tokio::join!(
+            send_file_chunks_from_root(&source, receiver_id, &files, &mut send),
+            receive_file_chunks(&destination, sender_id, &files, &mut recv),
+        );
+        sent.unwrap();
+        let completed = received.unwrap();
+        assert_eq!(completed.len(), contents.len());
+        for (file, (_, bytes)) in completed.iter().zip(contents) {
+            assert_eq!(fs::read(&file.staged_path).unwrap(), bytes);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn valid_transfer_partial_resumes_and_survives_verification() {
@@ -4009,7 +4118,7 @@ mod tests {
             5
         );
         fs::write(&partial, bytes).unwrap();
-        verify_partial(&partial, &file).unwrap();
+        verify_partial(&partial, &file, &mut Vec::new()).unwrap();
         assert!(partial.exists());
     }
 
@@ -4032,7 +4141,7 @@ mod tests {
         let partial = partial_path(&share, &file.path, &file.sha256);
         fs::write(&partial, b"corrupt!!!").unwrap();
 
-        let error = verify_partial(&partial, &file).unwrap_err();
+        let error = verify_partial(&partial, &file, &mut Vec::new()).unwrap_err();
 
         assert!(format!("{error:#}").contains("file.txt"));
         assert!(!partial.exists());

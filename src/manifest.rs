@@ -121,14 +121,16 @@ impl Manifest {
         self.tombstones.get(path).map(ManifestRecordRef::Tombstone)
     }
 
-    pub fn all_paths(&self) -> BTreeSet<String> {
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &String> {
         self.entries
             .keys()
             .chain(self.directories.keys())
             .chain(self.symlinks.keys())
             .chain(self.tombstones.keys())
-            .cloned()
-            .collect()
+    }
+
+    pub fn all_paths(&self) -> BTreeSet<String> {
+        self.paths().cloned().collect()
     }
 
     /// Hashes only synchronized state. Scan timestamps and local filesystem mtimes are excluded
@@ -386,8 +388,8 @@ pub fn scan_manifest(
     let mut tombstones = previous.tombstones.clone();
     let mut changes = 0_usize;
 
-    for (path, discovered_file) in &discovered.files {
-        let old_entry = previous.entries.get(path);
+    for (path, discovered_file) in discovered.files {
+        let old_entry = previous.entries.get(&path);
         let unchanged = old_entry.is_some_and(|entry| {
             entry.size == discovered_file.size
                 && entry.sha256 == discovered_file.sha256
@@ -404,8 +406,11 @@ pub fn scan_manifest(
             // equals the local disk mtime; converging it here lets the scan fast
             // path match on the very next cycle instead of re-hashing forever.
             ManifestEntry {
+                size: old_entry.size,
                 modified_at_ns: discovered_file.modified_at_ns,
-                ..old_entry.clone()
+                sha256: discovered_file.sha256,
+                permissions: old_entry.permissions,
+                version: old_entry.version,
             }
         } else {
             changes = changes.saturating_add(1);
@@ -413,7 +418,7 @@ pub fn scan_manifest(
             ManifestEntry {
                 size: discovered_file.size,
                 modified_at_ns: discovered_file.modified_at_ns,
-                sha256: discovered_file.sha256.clone(),
+                sha256: discovered_file.sha256,
                 permissions: selected_permissions(
                     old_entry.and_then(|entry| entry.permissions),
                     discovered_file.permissions,
@@ -421,13 +426,13 @@ pub fn scan_manifest(
                 version,
             }
         };
-        let _ = tombstones.remove(path);
-        let _ = symlinks.remove(path);
-        entries.insert(path.clone(), entry);
+        let _ = tombstones.remove(&path);
+        let _ = symlinks.remove(&path);
+        entries.insert(path, entry);
     }
 
-    for (path, discovered_directory) in &discovered.directories {
-        let old_entry = previous.directories.get(path);
+    for (path, discovered_directory) in discovered.directories {
+        let old_entry = previous.directories.get(&path);
         let unchanged = old_entry.is_some_and(|entry| {
             permissions_match(
                 entry.permissions,
@@ -447,25 +452,25 @@ pub fn scan_manifest(
                 version: clock.tick(now_ms, *endpoint_id.as_bytes())?,
             }
         };
-        let _ = tombstones.remove(path);
-        let _ = symlinks.remove(path);
-        directories.insert(path.clone(), entry);
+        let _ = tombstones.remove(&path);
+        let _ = symlinks.remove(&path);
+        directories.insert(path, entry);
     }
 
-    for (path, discovered_symlink) in &discovered.symlinks {
-        let old_entry = previous.symlinks.get(path);
+    for (path, discovered_symlink) in discovered.symlinks {
+        let old_entry = previous.symlinks.get(&path);
         let unchanged = old_entry.is_some_and(|entry| entry.target == discovered_symlink.target);
         let entry = if let Some(old_entry) = old_entry.filter(|_| unchanged) {
             old_entry.clone()
         } else {
             changes = changes.saturating_add(1);
             SymlinkEntry {
-                target: discovered_symlink.target.clone(),
+                target: discovered_symlink.target,
                 version: clock.tick(now_ms, *endpoint_id.as_bytes())?,
             }
         };
-        let _ = tombstones.remove(path);
-        symlinks.insert(path.clone(), entry);
+        let _ = tombstones.remove(&path);
+        symlinks.insert(path, entry);
     }
 
     for path in previous
@@ -478,9 +483,9 @@ pub fn scan_manifest(
         if previous.symlinks.contains_key(path) {
             continue;
         }
-        if !discovered.files.contains_key(path)
-            && !discovered.directories.contains_key(path)
-            && !discovered.symlinks.contains_key(path)
+        if !entries.contains_key(path)
+            && !directories.contains_key(path)
+            && !symlinks.contains_key(path)
         {
             changes = changes.saturating_add(1);
             tombstones.insert(
@@ -557,7 +562,8 @@ fn discover_entries(
     let symlinks = BTreeMap::new();
     #[cfg(not(windows))]
     let mut symlinks = BTreeMap::new();
-    for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
+    let mut hash_buffer = Vec::new();
+    for entry in WalkDir::new(root).follow_links(false) {
         let entry =
             entry.with_context(|| format!("unable to scan local directory {}", root.display()))?;
         if entry.path() == root {
@@ -631,7 +637,12 @@ fn discover_entries(
                         old.permissions,
                     )
                 }
-                _ => hash_stable_file(entry.path(), &metadata)?,
+                _ => {
+                    if hash_buffer.is_empty() {
+                        hash_buffer.resize(HASH_BUFFER_SIZE, 0);
+                    }
+                    hash_stable_file(entry.path(), &metadata, &mut hash_buffer)?
+                }
             };
             files.insert(
                 path,
@@ -654,6 +665,7 @@ fn discover_entries(
 fn hash_stable_file(
     path: &Path,
     expected_metadata: &fs::Metadata,
+    buffer: &mut [u8],
 ) -> Result<(u64, u64, String, Option<u16>)> {
     let first_size = expected_metadata.len();
     let first_modified = modified_at_ns(expected_metadata);
@@ -662,10 +674,9 @@ fn hash_stable_file(
         let mut file = File::open(path)
             .with_context(|| format!("unable to open local file {}", path.display()))?;
         let mut hasher = Sha256::new();
-        let mut buffer = vec![0_u8; HASH_BUFFER_SIZE].into_boxed_slice();
         loop {
             let count = file
-                .read(&mut buffer)
+                .read(buffer)
                 .with_context(|| format!("unable to read local file {}", path.display()))?;
             if count == 0 {
                 break;
@@ -702,7 +713,7 @@ fn permissions_from_metadata(metadata: &fs::Metadata) -> Option<u16> {
 }
 
 #[cfg(not(unix))]
-fn permissions_from_metadata(_metadata: &fs::Metadata) -> Option<u16> {
+const fn permissions_from_metadata(_metadata: &fs::Metadata) -> Option<u16> {
     None
 }
 
@@ -712,7 +723,11 @@ fn permissions_match(left: Option<u16>, right: Option<u16>, unknown_matches: boo
 }
 
 #[cfg(not(unix))]
-fn permissions_match(_left: Option<u16>, _right: Option<u16>, _unknown_matches: bool) -> bool {
+const fn permissions_match(
+    _left: Option<u16>,
+    _right: Option<u16>,
+    _unknown_matches: bool,
+) -> bool {
     true
 }
 
@@ -722,7 +737,7 @@ const fn selected_permissions(_previous: Option<u16>, discovered: Option<u16>) -
 }
 
 #[cfg(not(unix))]
-fn selected_permissions(previous: Option<u16>, _discovered: Option<u16>) -> Option<u16> {
+const fn selected_permissions(previous: Option<u16>, _discovered: Option<u16>) -> Option<u16> {
     previous
 }
 
@@ -810,7 +825,8 @@ pub fn merge_manifests(local: &Manifest, remote: &Manifest, now_ms: u64) -> Resu
     local.validate(local.share_id)?;
     remote.validate(local.share_id)?;
     let mut merged = Manifest::empty(local.share_id, now_ms);
-    for path in local.all_paths().union(&remote.all_paths()) {
+    let paths = local.paths().chain(remote.paths()).collect::<BTreeSet<_>>();
+    for path in paths {
         let local_record = local.record(path);
         let remote_record = remote.record(path);
         let selected = select_record(local_record, remote_record);
@@ -841,21 +857,12 @@ fn validate_manifest_hierarchy(manifest: &Manifest) -> Result<()> {
         .chain(manifest.directories.keys())
         .chain(manifest.symlinks.keys())
     {
-        let mut ancestor = String::new();
-        let mut components = path.split('/').peekable();
-        while let Some(component) = components.next() {
-            if components.peek().is_none() {
-                break;
-            }
-            if !ancestor.is_empty() {
-                ancestor.push('/');
-            }
-            ancestor.push_str(component);
-            if manifest.entries.contains_key(&ancestor) || manifest.symlinks.contains_key(&ancestor)
-            {
+        for (separator, _) in path.match_indices('/') {
+            let ancestor = &path[..separator];
+            if manifest.entries.contains_key(ancestor) || manifest.symlinks.contains_key(ancestor) {
                 bail!("manifest live path has a descendant: {ancestor}");
             }
-            if manifest.tombstones.contains_key(&ancestor) {
+            if manifest.tombstones.contains_key(ancestor) {
                 bail!("manifest has a live path below a tombstone: {ancestor}");
             }
         }
@@ -941,6 +948,30 @@ mod tests {
         );
         assert!(first.manifest_changed);
         assert!(!second.manifest_changed);
+    }
+
+    #[test]
+    fn scanner_assigns_file_versions_in_manifest_path_order() {
+        let temporary = TempDir::new().unwrap();
+        for path in ["z.txt", "b/a.txt", "b-1.txt", "a/z.txt", "a-1.txt"] {
+            let path = temporary.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "content").unwrap();
+        }
+        let share_id = ShareId([26; 32]);
+        let endpoint = SecretKey::from_bytes(&[27; 32]).public();
+        let scanned = scan_manifest(
+            temporary.path(),
+            &Manifest::empty(share_id, 1),
+            ClockState::new(),
+            &endpoint,
+            2,
+        )
+        .unwrap();
+        for (counter, entry) in scanned.manifest.entries.values().enumerate() {
+            assert_eq!(entry.version.wall_ms, 2);
+            assert_eq!(entry.version.counter, u32::try_from(counter).unwrap());
+        }
     }
 
     #[test]

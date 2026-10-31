@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -458,7 +458,8 @@ fn set_dir_permissions(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_dir_permissions(_path: &Path) -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+const fn set_dir_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -535,13 +536,29 @@ fn read_json<T: DeserializeOwned>(path: &Path, max_bytes: u64) -> Result<T> {
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T, private: bool) -> Result<()> {
-    let mut bytes =
-        serde_json::to_vec_pretty(value).context("unable to serialize persistent state")?;
-    bytes.push(b'\n');
-    atomic_write(path, &bytes, private)
+    atomic_write_with(path, private, |file| {
+        let mut writer = BufWriter::with_capacity(64 * 1024, file);
+        serde_json::to_writer(&mut writer, value)
+            .context("unable to serialize persistent state")?;
+        writer.write_all(b"\n")?;
+        writer
+            .flush()
+            .context("unable to flush persistent state buffer")
+    })
 }
 
 fn atomic_write(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
+    atomic_write_with(path, private, |file| {
+        file.write_all(bytes)
+            .context("unable to write persistent state")
+    })
+}
+
+fn atomic_write_with(
+    path: &Path,
+    private: bool,
+    write: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("persistent state path has no parent"))?;
@@ -569,7 +586,7 @@ fn atomic_write(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
                 )
             })?;
         set_file_permissions(&file, private)?;
-        file.write_all(bytes).with_context(|| {
+        write(&mut file).with_context(|| {
             format!(
                 "unable to write temporary state file {}",
                 temporary.display()
@@ -606,7 +623,8 @@ fn set_file_permissions(file: &File, _private: bool) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_file_permissions(_file: &File, _private: bool) -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+const fn set_file_permissions(_file: &File, _private: bool) -> Result<()> {
     Ok(())
 }
 
@@ -634,7 +652,9 @@ fn atomic_replace(temporary: &Path, target: &Path) -> std::io::Result<()> {
         .collect::<Vec<_>>();
     let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
     // Both paths include a trailing NUL and remain alive through the system call.
-    if unsafe { MoveFileExW(temporary_wide.as_ptr(), target_wide.as_ptr(), flags) } == 0 {
+    #[allow(unsafe_code)]
+    let result = unsafe { MoveFileExW(temporary_wide.as_ptr(), target_wide.as_ptr(), flags) };
+    if result == 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
@@ -649,7 +669,8 @@ fn sync_parent_directory(parent: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_parent_directory(_parent: &Path) -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+const fn sync_parent_directory(_parent: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -668,6 +689,20 @@ mod tests {
         paths.write_file_atomically(&path, b"first", true).unwrap();
         paths.write_file_atomically(&path, b"second", true).unwrap();
         assert_eq!(fs::read(path).unwrap(), b"second");
+    }
+
+    #[test]
+    fn failed_streamed_state_write_preserves_the_previous_value() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("state.json");
+        atomic_write(&path, b"previous", true).unwrap();
+        let result = atomic_write_with(&path, true, |file| {
+            file.write_all(b"incomplete")?;
+            bail!("interrupted serialization")
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"previous");
+        assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 1);
     }
 
     #[test]

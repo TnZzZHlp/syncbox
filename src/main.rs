@@ -1,6 +1,6 @@
 use std::{path::PathBuf, process::ExitCode};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use syncbox::{app::App, network::InitialSyncStatus};
 use tracing_subscriber::EnvFilter;
@@ -53,10 +53,9 @@ enum Command {
     Ticket { share_id: String },
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     init_tracing();
-    match run().await {
+    match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error:#}");
@@ -74,7 +73,15 @@ fn init_tracing() {
         .init();
 }
 
-async fn run() -> Result<()> {
+fn run_async<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("unable to start asynchronous runtime")?
+        .block_on(future)
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let app = App::discover()?;
     match cli.command {
@@ -95,7 +102,7 @@ async fn run() -> Result<()> {
             share_ticket,
             directory,
         } => {
-            let result = app.join(&share_ticket, &directory).await?;
+            let result = run_async(app.join(&share_ticket, &directory))?;
             println!("Shared directory registered");
             println!();
             println!("Name: {}", result.name);
@@ -115,7 +122,7 @@ async fn run() -> Result<()> {
             }
         }
         Command::Run { share_id, once } => {
-            let result = app.run(share_id.as_deref(), once).await?;
+            let result = run_async(app.run(share_id.as_deref(), once))?;
             if result.shares_started == 0 {
                 println!("No shared directories registered");
             }
