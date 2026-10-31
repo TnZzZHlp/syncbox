@@ -368,33 +368,26 @@ pub fn ensure_partial_file(path: &Path, offset: u64) -> Result<fs::File> {
         fs::create_dir_all(parent)
             .with_context(|| format!("unable to create transfer state {}", parent.display()))?;
     }
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && metadata.len() == offset => {}
-        Ok(metadata) if metadata.is_file() => {
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .open(path)
-                .with_context(|| format!("unable to open transfer partial {}", path.display()))?;
-            file.set_len(offset)
-                .with_context(|| format!("unable to resize transfer partial {}", path.display()))?;
-        }
+    let previous_length = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Some(metadata.len()),
         Ok(_) => bail!("transfer partial path is not a regular file"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let file = fs::File::create(path)
-                .with_context(|| format!("unable to create transfer partial {}", path.display()))?;
-            file.set_len(offset)
-                .with_context(|| format!("unable to resize transfer partial {}", path.display()))?;
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("unable to inspect transfer partial {}", path.display()));
         }
-    }
-    fs::OpenOptions::new()
+    };
+    let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .create_new(previous_length.is_none())
         .open(path)
-        .with_context(|| format!("unable to open transfer partial {}", path.display()))
+        .with_context(|| format!("unable to open transfer partial {}", path.display()))?;
+    if previous_length.unwrap_or(0) != offset {
+        file.set_len(offset)
+            .with_context(|| format!("unable to resize transfer partial {}", path.display()))?;
+    }
+    Ok(file)
 }
 
 pub fn verify_partial(path: &Path, file: &TransferFile, buffer: &mut Vec<u8>) -> Result<()> {

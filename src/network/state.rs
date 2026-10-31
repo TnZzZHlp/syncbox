@@ -139,7 +139,7 @@ impl ActiveShare {
 }
 
 #[cfg(windows)]
-pub(crate) fn unsupported_symlink_count(manifest: &Manifest) -> usize {
+pub fn unsupported_symlink_count(manifest: &Manifest) -> usize {
     manifest.symlinks.len()
 }
 

@@ -12,7 +12,9 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
+#[cfg(unix)]
+use anyhow::anyhow;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::{
     Endpoint, EndpointId, SecretKey, TransportAddr,
@@ -27,16 +29,18 @@ use tokio::{
 };
 
 #[cfg(unix)]
-use crate::manifest::DirectoryEntry;
+use crate::{
+    manifest::{DirectoryEntry, Tombstone},
+    network::local::*,
+};
 
 use super::*;
 use crate::{
     chunk::MAX_CHUNK_BYTES,
-    manifest::{MANIFEST_FORMAT_VERSION, Manifest, ManifestEntry, SymlinkEntry, Tombstone},
+    manifest::{MANIFEST_FORMAT_VERSION, Manifest, ManifestEntry, SymlinkEntry},
     network::{
         auth::*, client::*, incoming::*, io::IO_IDLE_TIMEOUT, io::ProgressIo, lifecycle::*,
-        local::*, registry::*, scheduling::*, state::*, transfer::*, transport::ConnectionPool,
-        wire::*,
+        registry::*, scheduling::*, state::*, transfer::*, transport::ConnectionPool, wire::*,
     },
     runtime::RuntimeStatusCache,
     types::{

@@ -1,6 +1,19 @@
 use super::*;
 
 #[test]
+fn resized_partial_preserves_prefix_and_returns_a_zero_positioned_handle() {
+    use std::io::Read as _;
+
+    let temporary = TempDir::new().unwrap();
+    let path = temporary.path().join("partial");
+    fs::write(&path, b"prefix-tail").unwrap();
+    let mut file = ensure_partial_file(&path, 6).unwrap();
+    let mut content = Vec::new();
+    file.read_to_end(&mut content).unwrap();
+    assert_eq!(content, b"prefix");
+}
+
+#[test]
 fn chunk_ranges_resume_from_existing_offset() {
     assert_eq!(chunk_ranges(10, 4, 3), vec![(4, 3), (7, 3), (10, 0)]);
 }

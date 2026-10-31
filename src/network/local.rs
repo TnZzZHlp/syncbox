@@ -532,7 +532,7 @@ pub fn directory_mode_allows_non_owner_writes(permissions: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn with_writable_parents<T>(
+pub fn with_writable_parents<T>(
     _root: &Path,
     _manifest_path: &str,
     _create_missing_parents: bool,
@@ -588,10 +588,7 @@ pub fn with_readable_file<T>(target: &Path, operation: impl FnOnce() -> Result<T
 }
 
 #[cfg(not(unix))]
-pub(crate) fn with_readable_file<T>(
-    _target: &Path,
-    operation: impl FnOnce() -> Result<T>,
-) -> Result<T> {
+pub fn with_readable_file<T>(_target: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
     operation()
 }
 
@@ -616,11 +613,7 @@ pub fn set_permissions(target: &Path, permissions: u16, directory: bool) -> Resu
 
 #[cfg(not(unix))]
 #[allow(clippy::unnecessary_wraps)]
-pub(crate) const fn set_permissions(
-    _target: &Path,
-    _permissions: u16,
-    _directory: bool,
-) -> Result<()> {
+pub const fn set_permissions(_target: &Path, _permissions: u16, _directory: bool) -> Result<()> {
     Ok(())
 }
 
@@ -678,7 +671,7 @@ pub fn with_writable_cross_device_target<T>(
 }
 
 #[cfg(not(unix))]
-pub(crate) fn with_writable_cross_device_target<T>(
+pub fn with_writable_cross_device_target<T>(
     _target: &Path,
     _final_permissions: Option<u16>,
     operation: impl FnOnce() -> Result<T>,

@@ -8,7 +8,7 @@ use crate::{manifest::Manifest, types::RuntimeState};
 pub use super::directory::process_alive;
 
 #[cfg(windows)]
-pub(crate) fn unsupported_symlink_count(manifest: &Manifest) -> usize {
+pub fn unsupported_symlink_count(manifest: &Manifest) -> usize {
     manifest.symlinks.len()
 }
 
