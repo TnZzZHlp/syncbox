@@ -1,6 +1,61 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires local multicast networking"]
+async fn local_discovery_synchronizes_without_external_lookup() {
+    use crate::network::discovery::attach_local_discovery;
+    use iroh::endpoint::presets;
+
+    let client = Endpoint::builder(presets::Minimal)
+        .alpns(vec![SYNCBOX_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let server = Endpoint::builder(presets::Minimal)
+        .alpns(vec![SYNCBOX_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    assert!(attach_local_discovery(&client, true));
+    assert!(attach_local_discovery(&server, true));
+    let temporary = TempDir::new().unwrap();
+    let client_root = temporary.path().join("client").join("shared");
+    let server_root = temporary.path().join("server").join("shared");
+    fs::create_dir_all(&client_root).unwrap();
+    fs::create_dir_all(&server_root).unwrap();
+    fs::write(server_root.join("lan.txt"), b"LAN sync").unwrap();
+    let share_id = ShareId([73; 32]);
+    let share = active_share(&client_root, Manifest::empty(share_id, 0), client.id());
+    let remote = active_share(&server_root, Manifest::empty(share_id, 0), server.id());
+    scan_and_save(&remote, &remote.config().unwrap()).unwrap();
+    let registry = ShareRegistry {
+        shares: Arc::new(HashMap::from([(share_id, remote)])),
+    };
+    let receiver = server.clone();
+    let handler = tokio::spawn(async move {
+        let connection = receiver.accept().await.unwrap().await.unwrap();
+        handle_incoming(
+            connection,
+            registry,
+            Arc::new(Semaphore::new(MAX_INCOMING_HANDLERS)),
+        )
+        .await
+        .unwrap();
+    });
+    timeout(
+        Duration::from_secs(25),
+        sync_with_peer(&client, &share, server.id()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(fs::read(client_root.join("lan.txt")).unwrap(), b"LAN sync");
+    client.close().await;
+    handler.await.unwrap();
+    server.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn busy_receiver_waits_for_stream_capacity_instead_of_resetting_the_stream() {
     use iroh::{address_lookup::memory::MemoryLookup, endpoint::presets};
 

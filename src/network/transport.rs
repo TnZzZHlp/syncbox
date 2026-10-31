@@ -15,6 +15,7 @@ use super::{
     SYNCBOX_ALPN,
     connection_cache::{ConnectionCache, PeerSlot, StreamLease},
     diagnostics::trace_connection,
+    discovery::attach_local_discovery,
 };
 
 pub(super) use super::connection_cache::{CONNECTION_IDLE_TIMEOUT, MAX_CONNECTION_STREAMS};
@@ -130,7 +131,7 @@ impl ConnectionPool {
 pub(super) async fn bind_endpoint(
     secret_key: iroh::SecretKey,
 ) -> std::result::Result<Endpoint, iroh::endpoint::BindError> {
-    Endpoint::builder(presets::N0)
+    let endpoint = Endpoint::builder(presets::N0)
         .clear_address_lookup()
         .address_lookup(PkarrPublisher::n0_dns().addr_filter(AddrFilter::unfiltered()))
         .address_lookup(PkarrResolver::n0_dns())
@@ -143,7 +144,12 @@ pub(super) async fn bind_endpoint(
         .secret_key(secret_key)
         .alpns(vec![SYNCBOX_ALPN.to_vec()])
         .bind()
-        .await
+        .await?;
+    attach_local_discovery(
+        &endpoint,
+        std::env::var_os("SYNCBOX_DISABLE_MDNS").is_none(),
+    );
+    Ok(endpoint)
 }
 
 #[cfg(test)]

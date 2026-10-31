@@ -21,6 +21,10 @@ Syncbox is a Rust command-line application for synchronizing multiple independen
   time out after 60 seconds without progress, rather than imposing a fixed total transfer duration.
   Incoming connections without active streams are released after 90 seconds of application inactivity.
   Busy receivers queue streams for up to 5 seconds instead of immediately resetting them.
+- Local mDNS discovery is enabled by default for finding known peers without external DNS or a relay.
+  It advertises the device Endpoint ID and IP addresses, not share credentials or file information.
+  Set `SYNCBOX_DISABLE_MDNS=1` to disable it for both `run` and `join`; any value, including an empty
+  value, disables it. If mDNS cannot start, synchronization continues with the other discovery services.
 - Local address changes and relay reconnections wake peer retries, coalesced to at most once every
   5 seconds without discarding usable connections. Debug logs include connection reuse, selected
   IPv4/IPv6/relay path snapshots, setup time, and RTT.

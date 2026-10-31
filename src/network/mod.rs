@@ -31,6 +31,7 @@ mod client;
 mod connection_cache;
 mod connectivity;
 mod diagnostics;
+mod discovery;
 mod incoming;
 mod io;
 mod lifecycle;
