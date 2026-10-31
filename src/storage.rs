@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(not(unix))]
 use directories_next::BaseDirs;
 use fs4::{FileExt, TryLockError};
 use rand::RngExt as _;
@@ -34,13 +35,16 @@ impl DataPaths {
             return Ok(Self { root });
         }
 
-        let base_dirs = BaseDirs::new().ok_or_else(|| {
-            anyhow!("the operating system did not provide a local application data directory")
-        })?;
-        Ok(Self {
-            // BaseDirs supplies the platform data root. Syncbox never constructs a home path.
-            root: base_dirs.data_local_dir().join("syncbox"),
-        })
+        #[cfg(unix)]
+        let root = PathBuf::from("/var/lib/syncbox");
+        #[cfg(not(unix))]
+        let root = BaseDirs::new()
+            .ok_or_else(|| {
+                anyhow!("the operating system did not provide a local application data directory")
+            })?
+            .data_local_dir()
+            .join("syncbox");
+        Ok(Self { root })
     }
 
     #[cfg(test)]

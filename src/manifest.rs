@@ -227,8 +227,10 @@ pub struct ManifestEntry {
 impl ManifestEntry {
     pub fn validate(&self) -> Result<()> {
         if self.sha256.len() != 64
-            || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || self.sha256.bytes().any(|byte| byte.is_ascii_uppercase())
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             bail!("manifest file hash must be 64 lowercase hexadecimal characters");
         }

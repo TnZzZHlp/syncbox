@@ -63,7 +63,7 @@ syncbox remove SHARE_ID
 
 ## State layout
 
-Syncbox stores state under the platform application-data directory. The global device identity is stored at `identity/device.key`. Share-specific records are stored below `shares/<share_id>/`, and locks are stored below `locks/`. Syncbox does not create `.syncbox` or other state files inside synchronized directories.
+Syncbox stores state under `/var/lib/syncbox` on Unix and `%LOCALAPPDATA%\syncbox` on Windows, unless `SYNCBOX_DATA_DIR` specifies an absolute path. The global device identity is stored at `identity/device.key`. Share-specific records are stored below `shares/<share_id>/`, and locks are stored below `locks/`. Syncbox does not create `.syncbox` or other state files inside synchronized directories.
 
 ## Service installation
 

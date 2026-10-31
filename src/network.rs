@@ -1518,8 +1518,9 @@ fn validate_transfer_files(files: &[TransferFile], manifest: &Manifest) -> Resul
 
 fn validate_sha256(value: &str) -> Result<()> {
     if value.len() != 64
-        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || value.bytes().any(|byte| byte.is_ascii_uppercase())
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         bail!("network transfer hash must be 64 lowercase hexadecimal characters");
     }
@@ -2362,17 +2363,13 @@ where
 
 fn known_peer_strings(share: &Arc<ActiveShare>, remote: &EndpointId) -> Result<Vec<String>> {
     let peers = share.paths.load_known_peers(share.share_id)?;
+    let local_id = share.local_endpoint_id.to_string();
+    let remote_id = remote.to_string();
     let mut values = peers
         .peers
-        .iter()
-        .filter_map(|peer| {
-            parse_endpoint_id(&peer.endpoint_id)
-                .ok()
-                .filter(|endpoint_id| {
-                    endpoint_id != &share.local_endpoint_id && endpoint_id != remote
-                })
-                .map(|_| peer.endpoint_id.clone())
-        })
+        .into_iter()
+        .filter(|peer| peer.endpoint_id != local_id && peer.endpoint_id != remote_id)
+        .map(|peer| peer.endpoint_id)
         .collect::<Vec<_>>();
     values.sort_unstable();
     values.dedup();
