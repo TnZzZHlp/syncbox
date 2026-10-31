@@ -21,8 +21,9 @@ use super::{
     local::config_root,
     registry::ShareRegistry,
     run_blocking,
-    scheduling::{SYNC_INTERVAL, scan_due},
+    scheduling::scan_due,
     state::{ActiveShare, refresh_heartbeat, scan_and_save},
+    workers::run_share_workers,
 };
 
 pub const MAX_CONCURRENT_SHARES: usize = 4;
@@ -183,38 +184,16 @@ pub async fn run_cycles(
     // Refresh status independently so a healthy process is never reported as stopped merely
     // because one peer is slow or unreachable.
     let heartbeat_task = spawn_heartbeat_loop(registry.clone());
-    let result =
-        match run_sync_cycle_until_shutdown(endpoint, registry, wait_for_shutdown_signal()).await {
-            Ok(true) if once => Ok(()),
-            Ok(true) => run_periodic_cycles(endpoint, registry, scan_notify).await,
-            Ok(false) => Ok(()),
-            Err(error) => Err(error),
-        };
+    let result = if once {
+        run_sync_cycle_until_shutdown(endpoint, registry, wait_for_shutdown_signal())
+            .await
+            .map(|_| ())
+    } else {
+        run_share_workers(endpoint, registry, scan_notify, wait_for_shutdown_signal()).await
+    };
     heartbeat_task.abort();
     let _ = heartbeat_task.await;
     result
-}
-
-pub async fn run_periodic_cycles(
-    endpoint: &Endpoint,
-    registry: &ShareRegistry,
-    scan_notify: &Notify,
-) -> Result<()> {
-    loop {
-        tokio::select! {
-            shutdown = wait_for_shutdown_signal() => {
-                shutdown?;
-                return Ok(());
-            }
-            () = tokio::time::sleep(SYNC_INTERVAL) => {}
-            () = scan_notify.notified() => {}
-        }
-        // A cycle may be waiting for a peer. Keep shutdown responsive instead of postponing a
-        // service-manager signal until connection and transfer deadlines expire.
-        if !run_sync_cycle_until_shutdown(endpoint, registry, wait_for_shutdown_signal()).await? {
-            return Ok(());
-        }
-    }
 }
 
 pub async fn run_sync_cycle_until_shutdown(

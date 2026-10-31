@@ -135,6 +135,92 @@ async fn address_changes_wake_backed_off_peers() {
         .unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_peer_does_not_block_another_shares_next_scan() {
+    use crate::network::workers::run_share_workers;
+    use iroh::{address_lookup::memory::MemoryLookup, endpoint::presets};
+
+    let lookup = MemoryLookup::new();
+    let client = Endpoint::builder(presets::Minimal)
+        .address_lookup(lookup.clone())
+        .alpns(vec![SYNCBOX_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let server = Endpoint::builder(presets::Minimal)
+        .alpns(vec![SYNCBOX_ALPN.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    lookup.add_endpoint_info(server.addr());
+    let temporary = TempDir::new().unwrap();
+    let slow_root = temporary.path().join("slow");
+    let fast_root = temporary.path().join("fast");
+    fs::create_dir(&slow_root).unwrap();
+    fs::create_dir(&fast_root).unwrap();
+    fs::write(fast_root.join("first.txt"), b"first").unwrap();
+    let slow_id = ShareId([74; 32]);
+    let fast_id = ShareId([75; 32]);
+    let slow = active_share(&slow_root, Manifest::empty(slow_id, 0), client.id());
+    let fast = active_share(&fast_root, Manifest::empty(fast_id, 0), client.id());
+    let mut peers = KnownPeers::empty();
+    peers.add_or_touch(&server.id(), 0);
+    slow.paths.save_known_peers(slow_id, &peers).unwrap();
+    let registry = ShareRegistry {
+        shares: Arc::new(HashMap::from([
+            (slow_id, slow),
+            (fast_id, Arc::clone(&fast)),
+        ])),
+    };
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let receiver = server.clone();
+    let handler = tokio::spawn(async move {
+        let connection = receiver.accept().await.unwrap().await.unwrap();
+        let (_send, mut recv) = connection.accept_bi().await.unwrap();
+        recv.read_exact(&mut [0; CLIENT_HELLO_LENGTH])
+            .await
+            .unwrap();
+        ready_tx.send(()).unwrap();
+        connection.closed().await;
+    });
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let notify = Notify::new();
+    let runner = run_share_workers(&client, &registry, &notify, async {
+        shutdown_rx.await.context("shutdown sender dropped")
+    });
+    let verify = async {
+        timeout(Duration::from_secs(8), async {
+            ready_rx.await.unwrap();
+            while !fast
+                .paths
+                .load_manifest(fast_id)
+                .unwrap()
+                .entries
+                .contains_key("first.txt")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            fs::write(fast_root.join("second.txt"), b"second").unwrap();
+            while !fast
+                .paths
+                .load_manifest(fast_id)
+                .unwrap()
+                .entries
+                .contains_key("second.txt")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown_tx.send(()).unwrap();
+    };
+    let (result, ()) = tokio::join!(runner, verify);
+    result.unwrap();
+    handler.await.unwrap();
+    server.close().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn incoming_handlers_are_drained_before_shutdown() {
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();

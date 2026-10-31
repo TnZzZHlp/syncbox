@@ -42,6 +42,7 @@ mod state;
 mod transfer;
 mod transport;
 mod wire;
+mod workers;
 
 pub use registry::{InitialSyncStatus, attempt_initial_sync};
 
