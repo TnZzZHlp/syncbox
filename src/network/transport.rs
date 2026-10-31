@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use iroh::{
@@ -11,7 +15,7 @@ use tokio::{
     time::timeout,
 };
 
-use super::SYNCBOX_ALPN;
+use super::{SYNCBOX_ALPN, diagnostics::trace_connection};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_CONCURRENT_DIALS: usize = 8;
@@ -36,6 +40,9 @@ impl Default for ConnectionPool {
 
 impl ConnectionPool {
     async fn connect(&self, endpoint: &Endpoint, peer: EndpointId) -> Result<Connection> {
+        if endpoint.is_closed() {
+            bail!("Iroh endpoint is closed");
+        }
         let slot = {
             let mut connections = self.connections.lock().await;
             connections.retain(|_, slot| {
@@ -53,7 +60,10 @@ impl ConnectionPool {
             .as_ref()
             .filter(|connection| connection.close_reason().is_none())
         {
-            return Ok(connection.clone());
+            let connection = connection.clone();
+            drop(cached);
+            trace_connection(&connection, true, None);
+            return Ok(connection);
         }
         *cached = None;
         let _permit = self
@@ -61,6 +71,10 @@ impl ConnectionPool {
             .acquire()
             .await
             .expect("dial semaphore is never closed");
+        if endpoint.is_closed() {
+            bail!("Iroh endpoint is closed");
+        }
+        let started = Instant::now();
         let connection = timeout(CONNECT_TIMEOUT, endpoint.connect(peer, SYNCBOX_ALPN))
             .await
             .context("timed out connecting to known Iroh endpoint")?
@@ -71,6 +85,7 @@ impl ConnectionPool {
         }
         *cached = Some(connection.clone());
         drop(cached);
+        trace_connection(&connection, false, Some(started.elapsed()));
         Ok(connection)
     }
 

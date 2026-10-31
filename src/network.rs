@@ -16,7 +16,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use iroh::{
     Endpoint, EndpointId,
-    endpoint::{Connection, RecvStream, SendStream},
+    endpoint::{Connection, RecvStream as RawRecvStream, SendStream as RawSendStream},
 };
 use notify::{RecursiveMode, Watcher};
 use rand::RngExt as _;
@@ -47,8 +47,13 @@ use crate::{
     },
 };
 
+mod connectivity;
+mod diagnostics;
+mod io;
 mod transport;
 
+use connectivity::spawn_connectivity_monitor;
+use io::{IO_IDLE_TIMEOUT, ProgressIo, RecvStream, SendStream};
 use transport::{CONNECTION_IDLE_TIMEOUT, ConnectionPool, bind_endpoint};
 
 pub const SYNCBOX_ALPN: &[u8] = b"syncbox/2";
@@ -58,7 +63,6 @@ const SERVER_HELLO_LENGTH: usize = 4 + 2 + 32 + 32 + 32 + 32 + 32;
 const MAX_CONTROL_FRAME_BYTES: usize = 96 * 1024 * 1024;
 const MAX_TRANSFER_FILES: usize = 256;
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
-const SYNC_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(300);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_INCOMING_HANDLERS: usize = 32;
 // ponytail: four concurrent shares; tune after multi-share throughput measurements.
@@ -82,6 +86,7 @@ struct ActiveShare {
     operation_lock: Arc<Mutex<()>>,
     runtime_status: Arc<std::sync::Mutex<RuntimeStatusCache>>,
     manifest_generation: Arc<AtomicU64>,
+    network_generation: Arc<AtomicU64>,
     manifest_cache: Arc<std::sync::Mutex<Option<Arc<ManifestSnapshot>>>>,
     peer_schedule: Arc<Mutex<HashMap<EndpointId, PeerSchedule>>>,
     connections: Arc<ConnectionPool>,
@@ -128,6 +133,11 @@ struct PeerSchedule {
 }
 
 impl PeerSchedule {
+    const fn retry_now(&mut self) {
+        self.next_at = None;
+        self.failures = 0;
+    }
+
     fn due(&self, now: Instant, generation: u64) -> bool {
         generation != self.last_attempted_generation || self.next_at.is_none_or(|at| now >= at)
     }
@@ -163,6 +173,30 @@ impl PeerSchedule {
 }
 
 impl ActiveShare {
+    async fn retry_peers(&self) {
+        self.network_generation.fetch_add(1, Ordering::AcqRel);
+        let mut schedules = self.peer_schedule.lock().await;
+        for schedule in schedules.values_mut() {
+            schedule.retry_now();
+        }
+    }
+
+    async fn record_peer_attempt(
+        &self,
+        peer: EndpointId,
+        generation: u64,
+        network_generation: u64,
+        outcome: Option<&SyncOutcome>,
+    ) {
+        let mut schedules = self.peer_schedule.lock().await;
+        let schedule = schedules.entry(peer).or_default();
+        schedule.after_attempt(Instant::now(), generation, outcome);
+        if self.network_generation.load(Ordering::Acquire) != network_generation {
+            schedule.retry_now();
+        }
+        drop(schedules);
+    }
+
     fn manifest_snapshot(&self) -> Result<Arc<ManifestSnapshot>> {
         let mut cache = self
             .manifest_cache
@@ -268,6 +302,9 @@ pub async fn run(
 
     let accept_task = spawn_accept_loop(endpoint.clone(), registry.clone());
     let scan_notify = Arc::new(Notify::new());
+    let connectivity_task = (!once).then(|| {
+        spawn_connectivity_monitor(endpoint.clone(), registry.clone(), Arc::clone(&scan_notify))
+    });
     let watchers = if once {
         Vec::new()
     } else {
@@ -276,6 +313,11 @@ pub async fn run(
     let result = run_cycles(&endpoint, &registry, once, &scan_notify).await;
     drop(watchers);
     endpoint.close().await;
+    if let Some(task) = connectivity_task
+        && let Err(error) = task.await
+    {
+        warn!(error = %error, "connectivity monitor failed during shutdown");
+    }
     if let Err(error) = accept_task.await {
         warn!(
             error = %format_args!("{error:#}"),
@@ -460,6 +502,7 @@ fn load_registry(
                 operation_lock: Arc::new(Mutex::new(())),
                 runtime_status: Arc::new(std::sync::Mutex::new(RuntimeStatusCache::default())),
                 manifest_generation: Arc::new(AtomicU64::new(0)),
+                network_generation: Arc::new(AtomicU64::new(0)),
                 manifest_cache: Arc::new(std::sync::Mutex::new(None)),
                 peer_schedule: Arc::new(Mutex::new(HashMap::new())),
                 connections: Arc::clone(&connections),
@@ -515,6 +558,7 @@ fn spawn_accept_loop(endpoint: Endpoint, registry: ShareRegistry) -> JoinHandle<
                     let stream_permits = Arc::clone(&stream_permits);
                     handlers.spawn(async move {
                         let _permit = permit;
+                        let started = Instant::now();
                         let connection = match timeout(HANDSHAKE_TIMEOUT, incoming).await {
                             Ok(Ok(connection)) => connection,
                             Ok(Err(error)) => {
@@ -532,6 +576,7 @@ fn spawn_accept_loop(endpoint: Endpoint, registry: ShareRegistry) -> JoinHandle<
                                 return;
                             }
                         };
+                        diagnostics::trace_connection(&connection, false, Some(started.elapsed()));
                         let peer_endpoint_id = connection.remote_id();
                         if let Err(error) = handle_incoming(connection, registry, stream_permits).await {
                             warn!(
@@ -558,15 +603,13 @@ async fn run_cycles(
     // Refresh status independently so a healthy process is never reported as stopped merely
     // because one peer is slow or unreachable.
     let heartbeat_task = spawn_heartbeat_loop(registry.clone());
-    let result = if run_sync_cycle_until_shutdown(endpoint, registry).await? {
-        if once {
-            Ok(())
-        } else {
-            run_periodic_cycles(endpoint, registry, scan_notify).await
-        }
-    } else {
-        Ok(())
-    };
+    let result =
+        match run_sync_cycle_until_shutdown(endpoint, registry, wait_for_shutdown_signal()).await {
+            Ok(true) if once => Ok(()),
+            Ok(true) => run_periodic_cycles(endpoint, registry, scan_notify).await,
+            Ok(false) => Ok(()),
+            Err(error) => Err(error),
+        };
     heartbeat_task.abort();
     let _ = heartbeat_task.await;
     result
@@ -588,7 +631,7 @@ async fn run_periodic_cycles(
         }
         // A cycle may be waiting for a peer. Keep shutdown responsive instead of postponing a
         // service-manager signal until connection and transfer deadlines expire.
-        if !run_sync_cycle_until_shutdown(endpoint, registry).await? {
+        if !run_sync_cycle_until_shutdown(endpoint, registry, wait_for_shutdown_signal()).await? {
             return Ok(());
         }
     }
@@ -597,14 +640,15 @@ async fn run_periodic_cycles(
 async fn run_sync_cycle_until_shutdown(
     endpoint: &Endpoint,
     registry: &ShareRegistry,
+    shutdown: impl std::future::Future<Output = Result<()>>,
 ) -> Result<bool> {
     // Keep the cycle future alive after shutdown wins. Its JoinSet owns work that may be inside
     // block_in_place, which Tokio cannot cancel.
     let cycle = run_sync_cycle(endpoint, registry);
     tokio::pin!(cycle);
     tokio::select! {
-        shutdown = wait_for_shutdown_signal() => {
-            let shutdown_result = shutdown;
+        shutdown_result = shutdown => {
+            endpoint.close().await;
             cycle.await;
             shutdown_result?;
             Ok(false)
@@ -811,6 +855,7 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
     }
 
     let generation = share.manifest_generation.load(Ordering::Relaxed);
+    let network_generation = share.network_generation.load(Ordering::Acquire);
     {
         let mut schedules = share.peer_schedule.lock().await;
         schedules.retain(|peer, _| candidates.contains(peer));
@@ -848,12 +893,8 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
                 peer_endpoint_id = %peer,
                 "starting peer synchronization"
             );
-            let result = timeout(
-                SYNC_EXCHANGE_TIMEOUT,
-                sync_with_peer(&endpoint, &share, peer),
-            )
-            .await;
-            let peer_outcome = result.as_ref().ok().and_then(|result| result.as_ref().ok());
+            let result = sync_with_peer(&endpoint, &share, peer).await;
+            let peer_outcome = result.as_ref().ok();
             let outcome = peer_outcome.map(|outcome| SyncOutcome {
                 connected: true,
                 pending_downloads: outcome.pending_downloads,
@@ -861,12 +902,8 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
                 ..SyncOutcome::default()
             });
             share
-                .peer_schedule
-                .lock()
-                .await
-                .entry(peer)
-                .or_default()
-                .after_attempt(Instant::now(), generation, outcome.as_ref());
+                .record_peer_attempt(peer, generation, network_generation, outcome.as_ref())
+                .await;
             (peer, result)
         });
     }
@@ -875,7 +912,7 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
     let mut synchronized = false;
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok((peer, Ok(Ok(peer_outcome)))) => {
+            Ok((peer, Ok(peer_outcome))) => {
                 synchronized = true;
                 info!(
                     share_id = %share.share_id,
@@ -885,23 +922,13 @@ async fn sync_known_peers(endpoint: &Endpoint, share: &Arc<ActiveShare>) -> Resu
                     "peer synchronization completed"
                 );
             }
-            Ok((peer, Ok(Err(error)))) => {
-                had_connection_error = true;
-                warn!(
-                    share_id = %share.share_id,
-                    peer_endpoint_id = %peer,
-                    error = %format_args!("{error:#}"),
-                    "peer synchronization failed"
-                );
-                set_runtime_error(share, "could not connect to a known peer")?;
-            }
             Ok((peer, Err(error))) => {
                 had_connection_error = true;
                 warn!(
                     share_id = %share.share_id,
                     peer_endpoint_id = %peer,
                     error = %format_args!("{error:#}"),
-                    "peer synchronization timed out"
+                    "peer synchronization failed"
                 );
                 set_runtime_error(share, "could not connect to a known peer")?;
             }
@@ -974,10 +1001,12 @@ async fn sync_with_peer(
         peer_endpoint_id = %expected_peer,
         "connecting to peer"
     );
-    let (mut send, mut recv) = share
+    let (send, recv) = share
         .connections
         .open_stream(endpoint, expected_peer)
         .await?;
+    let mut send = ProgressIo::new(send, IO_IDLE_TIMEOUT);
+    let mut recv = ProgressIo::new(recv, IO_IDLE_TIMEOUT);
     info!(
         share_id = %share.share_id,
         peer_endpoint_id = %expected_peer,
@@ -990,12 +1019,14 @@ async fn sync_with_peer(
 
     let nonce: [u8; 32] = rand::rng().random();
     let client_hello = make_client_hello(&config, &share.local_endpoint_id, &expected_peer, nonce);
-    send.write_all(&client_hello)
-        .await
-        .context("unable to send sync authentication")?;
-    let server_hello = timeout(HANDSHAKE_TIMEOUT, read_server_hello(&mut recv))
-        .await
-        .context("timed out waiting for peer authentication")??;
+    let server_hello = timeout(HANDSHAKE_TIMEOUT, async {
+        send.write_all(&client_hello)
+            .await
+            .context("unable to send sync authentication")?;
+        read_server_hello(&mut recv).await
+    })
+    .await
+    .context("timed out waiting for peer authentication")??;
     validate_server_hello(
         &server_hello,
         &config,
@@ -1046,7 +1077,8 @@ async fn sync_with_peer(
                 run_blocking(|| scan_and_save(share, &updated_config))?;
             }
         }
-        send.finish()
+        send.inner_mut()
+            .finish()
             .context("unable to finish unchanged sync stream")?;
         info!(
             share_id = %share.share_id,
@@ -1113,7 +1145,9 @@ async fn sync_with_peer(
         &mut send,
     )
     .await?;
-    send.finish().context("unable to finish upload stream")?;
+    send.inner_mut()
+        .finish()
+        .context("unable to finish upload stream")?;
     let final_response: TransferResponse = read_json_frame(&mut recv).await?;
     validate_transfer_response(&final_response, share.share_id)?;
     info!(
@@ -1173,21 +1207,14 @@ async fn handle_incoming(
     permits: Arc<Semaphore>,
 ) -> Result<()> {
     let peer = connection.remote_id();
-    let (send, recv) = timeout(HANDSHAKE_TIMEOUT, connection.accept_bi())
-        .await
-        .context("timed out waiting for sync stream")?
-        .context("unable to accept sync stream")?;
-    let permit = Arc::clone(&permits).try_acquire_owned()?;
-    timeout(
-        SYNC_EXCHANGE_TIMEOUT,
-        handle_sync_stream(peer, send, recv, registry.clone()),
-    )
-    .await
-    .context("incoming synchronization timed out")??;
-    drop(permit);
-
+    let authenticated = Arc::new(AtomicBool::new(false));
     let mut streams = tokio::task::JoinSet::new();
     loop {
+        let idle_timeout = if authenticated.load(Ordering::Acquire) {
+            CONNECTION_IDLE_TIMEOUT
+        } else {
+            HANDSHAKE_TIMEOUT
+        };
         tokio::select! {
             biased;
             Some(result) = streams.join_next(), if !streams.is_empty() => {
@@ -1195,23 +1222,27 @@ async fn handle_incoming(
                     warn!(peer_endpoint_id = %peer, error = %error, "incoming stream task failed");
                 }
             }
-            incoming = timeout(CONNECTION_IDLE_TIMEOUT, connection.accept_bi()) => {
+            incoming = timeout(idle_timeout, connection.accept_bi()) => {
                 match incoming {
                     Ok(Ok((send, recv))) => {
                         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
                             continue;
                         };
                         let registry = registry.clone();
+                        let authenticated = Arc::clone(&authenticated);
+                        let connection = connection.clone();
                         streams.spawn(async move {
                             let _permit = permit;
-                            let result = timeout(SYNC_EXCHANGE_TIMEOUT, handle_sync_stream(peer, send, recv, registry)).await;
-                            if let Err(error) = result.context("incoming synchronization timed out").and_then(std::convert::identity) {
+                            if let Err(error) = handle_sync_stream(peer, send, recv, registry, &authenticated).await {
                                 warn!(peer_endpoint_id = %peer, error = %format_args!("{error:#}"), "incoming synchronization failed");
+                                if !authenticated.load(Ordering::Acquire) {
+                                    connection.close(0_u8.into(), b"sync authentication failed");
+                                }
                             }
                         });
                     }
                     Ok(Err(_)) => break,
-                    Err(_) if streams.is_empty() => {
+                    Err(_) if streams.is_empty() || !authenticated.load(Ordering::Acquire) => {
                         connection.close(0_u8.into(), b"sync idle");
                         break;
                     }
@@ -1226,10 +1257,13 @@ async fn handle_incoming(
 
 async fn handle_sync_stream(
     peer_endpoint_id: EndpointId,
-    mut send: SendStream,
-    mut recv: RecvStream,
+    send: RawSendStream,
+    recv: RawRecvStream,
     registry: ShareRegistry,
+    authenticated: &AtomicBool,
 ) -> Result<()> {
+    let mut send = ProgressIo::new(send, IO_IDLE_TIMEOUT);
+    let mut recv = ProgressIo::new(recv, IO_IDLE_TIMEOUT);
     let client_hello = timeout(HANDSHAKE_TIMEOUT, read_client_hello(&mut recv))
         .await
         .context("timed out waiting for sync authentication")??;
@@ -1243,6 +1277,7 @@ async fn handle_sync_stream(
         &peer_endpoint_id,
         &share.local_endpoint_id,
     )?;
+    authenticated.store(true, Ordering::Release);
     info!(
         share_id = %share.share_id,
         peer_endpoint_id = %peer_endpoint_id,
@@ -1256,8 +1291,9 @@ async fn handle_sync_stream(
         client_hello.nonce,
         server_nonce,
     );
-    send.write_all(&server_hello)
+    timeout(HANDSHAKE_TIMEOUT, send.write_all(&server_hello))
         .await
+        .context("timed out sending sync authentication")?
         .context("unable to send sync authentication")?;
 
     let request: SyncRequest = read_json_frame(&mut recv).await?;
@@ -1282,9 +1318,10 @@ async fn handle_sync_stream(
     .await?;
 
     if request.manifest_digest == local_digest {
-        send.finish()
+        send.inner_mut()
+            .finish()
             .context("unable to finish unchanged sync stream")?;
-        let _ = timeout(Duration::from_secs(5), send.stopped()).await;
+        let _ = timeout(Duration::from_secs(5), send.inner_mut().stopped()).await;
         let unsupported_items = unsupported_symlink_count(&local_manifest.manifest);
         update_runtime(&share, |status, now_ms| {
             status.last_connection_at_ms = Some(now_ms);
@@ -1384,11 +1421,12 @@ async fn handle_sync_stream(
     )
     .await?;
     send_file_chunks_from_root(&share, peer_endpoint_id, &files, &mut send).await?;
-    send.finish()
+    send.inner_mut()
+        .finish()
         .context("unable to finish sync response stream")?;
     // Keep the connection alive until the client has acknowledged the final response. Dropping an
     // Iroh connection immediately after finish can abandon buffered stream data.
-    let _ = timeout(Duration::from_secs(5), send.stopped()).await;
+    let _ = timeout(Duration::from_secs(5), send.inner_mut().stopped()).await;
     update_runtime(&share, |status, now_ms| {
         status.last_connection_at_ms = Some(now_ms);
         if applied.applied_records > 0 {
@@ -3620,6 +3658,21 @@ mod tests {
             .unwrap();
         });
         timeout(Duration::from_secs(10), async {
+            let (send, recv) = connections.open_stream(&client, server.id()).await.unwrap();
+            let mut stalled_send = ProgressIo::new(send, IO_IDLE_TIMEOUT);
+            let mut stalled_recv = ProgressIo::new(recv, IO_IDLE_TIMEOUT);
+            let hello = make_client_hello(
+                &clients[0].config().unwrap(),
+                &client.id(),
+                &server.id(),
+                [66; 32],
+            );
+            stalled_send.write_all(&hello).await.unwrap();
+            read_server_hello(&mut stalled_recv).await.unwrap();
+            sync_with_peer(&client, &clients[1], server.id())
+                .await
+                .unwrap();
+            drop((stalled_send, stalled_recv));
             for _ in 0..2 {
                 for share in &clients {
                     sync_with_peer(&client, share, server.id()).await.unwrap();
@@ -3631,6 +3684,106 @@ mod tests {
         client.close().await;
         handler.await.unwrap();
         server.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_interrupts_a_peer_wait_without_abandoning_the_cycle() {
+        use iroh::{address_lookup::memory::MemoryLookup, endpoint::presets};
+
+        let lookup = MemoryLookup::new();
+        let client = Endpoint::builder(presets::Minimal)
+            .address_lookup(lookup.clone())
+            .alpns(vec![SYNCBOX_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![SYNCBOX_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        lookup.add_endpoint_info(server.addr());
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("shared");
+        fs::create_dir(&root).unwrap();
+        let share_id = ShareId([65; 32]);
+        let share = active_share(&root, Manifest::empty(share_id, 0), client.id());
+        let mut peers = KnownPeers::empty();
+        peers.add_or_touch(&server.id(), 0);
+        share.paths.save_known_peers(share_id, &peers).unwrap();
+        let registry = ShareRegistry {
+            shares: Arc::new(HashMap::from([(share_id, share)])),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let receiver = server.clone();
+        let handler = tokio::spawn(async move {
+            let connection = receiver.accept().await.unwrap().await.unwrap();
+            let (_send, mut recv) = connection.accept_bi().await.unwrap();
+            recv.read_exact(&mut [0; CLIENT_HELLO_LENGTH])
+                .await
+                .unwrap();
+            shutdown_tx.send(()).unwrap();
+            connection.closed().await;
+        });
+        let result = timeout(
+            Duration::from_secs(3),
+            run_sync_cycle_until_shutdown(&client, &registry, async {
+                shutdown_rx.await.context("shutdown sender dropped")
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!result);
+        handler.await.unwrap();
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn address_changes_wake_backed_off_peers() {
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![SYNCBOX_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("shared");
+        fs::create_dir(&root).unwrap();
+        let share_id = ShareId([69; 32]);
+        let share = active_share(&root, Manifest::empty(share_id, 0), endpoint.id());
+        let peer = SecretKey::from_bytes(&[70; 32]).public();
+        share.record_peer_attempt(peer, 0, 0, None).await;
+        let registry = ShareRegistry {
+            shares: Arc::new(HashMap::from([(share_id, Arc::clone(&share))])),
+        };
+        let notify = Arc::new(Notify::new());
+        let monitor = spawn_connectivity_monitor(endpoint.clone(), registry, Arc::clone(&notify));
+        endpoint
+            .add_external_addr("192.0.2.1:12345".parse().unwrap())
+            .await;
+        timeout(Duration::from_secs(3), notify.notified())
+            .await
+            .unwrap();
+        assert!(share.peer_schedule.lock().await[&peer].due(Instant::now(), 0));
+        endpoint.close().await;
+        timeout(Duration::from_secs(3), monitor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_during_an_attempt_is_not_lost_when_that_attempt_finishes() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("shared");
+        fs::create_dir(&root).unwrap();
+        let peer = SecretKey::from_bytes(&[67; 32]).public();
+        let share = active_share(&root, Manifest::empty(ShareId([68; 32]), 0), peer);
+        share.record_peer_attempt(peer, 0, 0, None).await;
+        assert!(!share.peer_schedule.lock().await[&peer].due(Instant::now(), 0));
+        share.retry_peers().await;
+        share.record_peer_attempt(peer, 0, 0, None).await;
+        assert!(share.peer_schedule.lock().await[&peer].due(Instant::now(), 0));
     }
 
     #[test]
@@ -4127,6 +4280,7 @@ mod tests {
             operation_lock: Arc::new(Mutex::new(())),
             runtime_status: Arc::new(std::sync::Mutex::new(RuntimeStatusCache::default())),
             manifest_generation: Arc::new(AtomicU64::new(0)),
+            network_generation: Arc::new(AtomicU64::new(0)),
             manifest_cache: Arc::new(std::sync::Mutex::new(None)),
             peer_schedule: Arc::new(Mutex::new(HashMap::new())),
             connections: Arc::new(ConnectionPool::default()),
