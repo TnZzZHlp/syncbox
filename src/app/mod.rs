@@ -1,12 +1,17 @@
+//! Command workflows and status reporting.
+//!
+//! - `App`: durable operations over a `DataPaths` root (init, join, remove, scan, status, tickets).
+//! - `directory`: shared-directory normalization, isolation, and path helpers.
+//! - `status`: runtime assessment, JSON status records, and human-readable formatting.
+
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, SecondsFormat, Utc};
 use iroh::EndpointId;
-use serde::Serialize;
+
+use anyhow::{Context, Result, bail};
 
 use crate::{
     identity,
@@ -17,11 +22,21 @@ use crate::{
     types::{
         ClockState, FORMAT_VERSION, KnownPeers, PeerRecord, RuntimeState, RuntimeStatus,
         ShareConfig, ShareId, ShareIdentity, SyncHealth, endpoint_id_string, parse_endpoint_id,
-        validate_share_name,
     },
 };
 
-pub const STATUS_HEARTBEAT_STALE_MS: u64 = 15_000;
+mod directory;
+mod status;
+
+pub use status::{STATUS_HEARTBEAT_STALE_MS, ShareStatus, StatusReport};
+
+use directory::{
+    canonical_or_projected_path, config_directory, determine_share_name, normalize_local_directory,
+    path_to_config_string,
+};
+use status::{
+    RuntimeAssessment, StatusDetails, format_timestamp, process_alive, unsupported_symlink_count,
+};
 
 #[derive(Clone)]
 pub struct App {
@@ -539,6 +554,7 @@ impl App {
 }
 
 #[derive(Clone, Debug)]
+
 pub struct InitResult {
     pub name: String,
     pub share_id: ShareId,
@@ -589,444 +605,5 @@ pub struct GeneratedTicket {
     pub ticket: String,
 }
 
-#[derive(Clone, Serialize)]
-pub struct ShareStatus {
-    pub share_id: String,
-    pub name: String,
-    pub local_directory: String,
-    pub endpoint_id: String,
-    pub runtime: String,
-    pub health: String,
-    pub files: usize,
-    pub tombstones: usize,
-    pub known_peers: usize,
-    pub connected_peers: usize,
-    pub pending_downloads: usize,
-    pub pending_updates: usize,
-    pub unsupported_items: usize,
-    pub last_local_scan: Option<String>,
-    pub last_remote_update: Option<String>,
-    pub last_successful_sync: Option<String>,
-    pub last_connection: Option<String>,
-    pub last_error: Option<String>,
-}
-
-#[derive(Clone, Serialize)]
-pub struct StatusReport {
-    pub shares: Vec<ShareStatus>,
-    #[serde(skip_serializing)]
-    details: Vec<StatusDetails>,
-}
-
-#[derive(Clone)]
-struct StatusDetails {
-    heartbeat_stale: bool,
-    last_recorded_state: Option<RuntimeState>,
-    output: ShareStatus,
-}
-
-impl StatusReport {
-    pub fn human_text(&self) -> String {
-        if self.details.is_empty() {
-            return "No shared directories registered\n".to_owned();
-        }
-        self.details
-            .iter()
-            .map(format_human_share_status)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
-struct RuntimeAssessment {
-    runtime: RuntimeState,
-    heartbeat_stale: bool,
-    last_recorded_state: Option<RuntimeState>,
-}
-
-fn canonical_or_projected_path(path: &Path) -> Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("unable to determine the current directory")?
-            .join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            component => normalized.push(component.as_os_str()),
-        }
-    }
-    let mut missing_tail = Vec::new();
-    let mut existing = normalized.as_path();
-    while !existing.exists() {
-        let name = existing
-            .file_name()
-            .ok_or_else(|| anyhow!("path has no existing ancestor"))?;
-        missing_tail.push(name.to_os_string());
-        existing = existing
-            .parent()
-            .ok_or_else(|| anyhow!("path has no existing ancestor"))?;
-    }
-    let mut resolved = fs::canonicalize(existing)
-        .with_context(|| format!("unable to normalize path {}", existing.display()))?;
-    for component in missing_tail.iter().rev() {
-        resolved.push(component);
-    }
-    Ok(resolved)
-}
-
-fn normalize_local_directory(requested_directory: &Path) -> Result<PathBuf> {
-    if requested_directory.exists() {
-        let metadata = fs::metadata(requested_directory).with_context(|| {
-            format!(
-                "unable to inspect local directory {}",
-                requested_directory.display()
-            )
-        })?;
-        if !metadata.is_dir() {
-            bail!("{} is not a directory", requested_directory.display());
-        }
-    } else {
-        fs::create_dir_all(requested_directory).with_context(|| {
-            format!(
-                "unable to create local directory {}",
-                requested_directory.display()
-            )
-        })?;
-    }
-    let directory = fs::canonicalize(requested_directory).with_context(|| {
-        format!(
-            "unable to normalize local directory {}",
-            requested_directory.display()
-        )
-    })?;
-    if directory.to_str().is_none() {
-        bail!("local directory path is not valid UTF-8");
-    }
-    Ok(directory)
-}
-
-fn path_to_config_string(path: &Path) -> Result<String> {
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow!("local directory path is not valid UTF-8"))
-}
-
-fn config_directory(config: &ShareConfig) -> Result<PathBuf> {
-    let path = PathBuf::from(&config.local_directory);
-    let metadata = fs::metadata(&path)
-        .with_context(|| format!("unable to inspect local directory {}", path.display()))?;
-    if !metadata.is_dir() {
-        bail!(
-            "registered local path {} is not a directory",
-            path.display()
-        );
-    }
-    fs::canonicalize(&path)
-        .with_context(|| format!("unable to normalize local directory {}", path.display()))
-}
-
-fn determine_share_name(local_directory: &Path, requested_name: Option<&str>) -> Result<String> {
-    let name = requested_name.map_or_else(
-        || {
-            local_directory
-                .file_name()
-                .and_then(|component| component.to_str())
-                .filter(|component| !component.is_empty())
-                .unwrap_or("share")
-                .to_owned()
-        },
-        std::borrow::ToOwned::to_owned,
-    );
-    validate_share_name(&name)?;
-    Ok(name)
-}
-
-#[cfg(windows)]
-const fn unsupported_symlink_count(manifest: &Manifest) -> usize {
-    manifest.symlinks.len()
-}
-
-#[cfg(not(windows))]
-const fn unsupported_symlink_count(_manifest: &Manifest) -> usize {
-    0
-}
-
-fn format_timestamp(value: Option<u64>) -> Option<String> {
-    value.and_then(|milliseconds| {
-        i64::try_from(milliseconds)
-            .ok()
-            .and_then(DateTime::<Utc>::from_timestamp_millis)
-            .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
-    })
-}
-
-fn format_human_share_status(details: &StatusDetails) -> String {
-    let status = &details.output;
-    let mut lines = vec![
-        format!("Share: {}", status.name),
-        format!("Share ID: {}", status.share_id),
-        format!("Local directory: {}", status.local_directory),
-        String::new(),
-        format!("Runtime: {}", status.runtime),
-        format!("Health: {}", status.health),
-        String::new(),
-        format!("Endpoint ID: {}", status.endpoint_id),
-        format!("Files: {}", status.files),
-        format!("Tombstones: {}", status.tombstones),
-        String::new(),
-        format!("Known peers: {}", status.known_peers),
-        format!("Connected peers: {}", status.connected_peers),
-        String::new(),
-        format!("Pending downloads: {}", status.pending_downloads),
-        format!("Pending updates: {}", status.pending_updates),
-        format!("Unsupported items: {}", status.unsupported_items),
-        String::new(),
-        format!(
-            "Last local scan: {}",
-            display_optional(status.last_local_scan.as_deref())
-        ),
-        format!(
-            "Last remote update: {}",
-            display_optional(status.last_remote_update.as_deref())
-        ),
-        format!(
-            "Last successful sync: {}",
-            display_optional(status.last_successful_sync.as_deref())
-        ),
-        format!(
-            "Last connection: {}",
-            display_optional(status.last_connection.as_deref())
-        ),
-        format!(
-            "Last error: {}",
-            display_optional(status.last_error.as_deref())
-        ),
-    ];
-    if let Some(state) = details.last_recorded_state {
-        lines.push(format!("Last recorded state: {state}"));
-    }
-    if details.heartbeat_stale {
-        lines.push("Status heartbeat is stale".to_owned());
-    }
-    lines.push(String::new());
-    lines.join("\n")
-}
-
-fn display_optional(value: Option<&str>) -> &str {
-    value.unwrap_or("none")
-}
-
-#[cfg(target_os = "linux")]
-fn process_alive(process_id: u32) -> bool {
-    if process_id == 0 {
-        return false;
-    }
-    Path::new("/proc").join(process_id.to_string()).exists()
-}
-
-#[cfg(not(target_os = "linux"))]
-#[allow(clippy::unnecessary_wraps)]
-const fn process_alive(process_id: u32) -> bool {
-    if process_id == 0 {
-        false
-    } else {
-        // The lock plus a fresh heartbeat remains authoritative on platforms where the process
-        // table is not exposed through a portable standard-library API.
-        true
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use tempfile::TempDir;
-
-    use super::*;
-    use crate::storage::DataPaths;
-
-    #[test]
-    fn init_registers_state_outside_the_shared_directory() {
-        let temporary = TempDir::new().unwrap();
-        let root = temporary.path().join("workspace");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("settings.txt"), "value").unwrap();
-        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
-        let result = app.init(&root, Some("config")).unwrap();
-        assert!(!root.join(".syncbox").exists());
-        assert!(app.paths().share_config(result.share_id).exists());
-        assert!(app.paths().share_manifest(result.share_id).exists());
-        assert!(app.paths().share_clock(result.share_id).exists());
-        assert!(app.paths().share_known_peers(result.share_id).exists());
-        assert!(app.paths().share_runtime_status(result.share_id).exists());
-    }
-
-    #[test]
-    fn remove_unregisters_share_without_deleting_local_files() {
-        let temporary = TempDir::new().unwrap();
-        let root = temporary.path().join("workspace");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("keep.txt"), "keep").unwrap();
-        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
-        let result = app.init(&root, None).unwrap();
-        let share_id = result.share_id.to_string();
-
-        let removed = app.remove(&share_id[..8]).unwrap();
-
-        assert_eq!(removed.share_id, result.share_id);
-        assert!(!app.paths().share_dir(result.share_id).exists());
-        assert_eq!(fs::read_to_string(root.join("keep.txt")).unwrap(), "keep");
-        assert_eq!(app.all_share_ids().unwrap(), Vec::<ShareId>::new());
-    }
-
-    #[test]
-    fn remove_requires_full_id_for_invalid_state() {
-        let temporary = TempDir::new().unwrap();
-        let root = temporary.path().join("workspace");
-        fs::create_dir_all(&root).unwrap();
-        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
-        let result = app.init(&root, None).unwrap();
-        let share_id = result.share_id.to_string();
-        fs::write(app.paths().share_manifest(result.share_id), "invalid").unwrap();
-
-        let error = app.remove(&share_id[..8]).unwrap_err().to_string();
-        assert!(error.contains("use its full 64-character Share ID"));
-        assert!(app.paths().share_dir(result.share_id).is_dir());
-
-        app.remove(&share_id).unwrap();
-        assert!(!app.paths().share_dir(result.share_id).exists());
-        assert!(root.is_dir());
-    }
-
-    #[test]
-    fn remove_rejects_a_share_that_is_in_use() {
-        let temporary = TempDir::new().unwrap();
-        let root = temporary.path().join("workspace");
-        fs::create_dir_all(&root).unwrap();
-        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
-        let result = app.init(&root, None).unwrap();
-        let _lock = app.paths().acquire_share_lock(result.share_id).unwrap();
-
-        let error = app.remove(&result.share_id.to_string()).unwrap_err();
-
-        assert!(error.to_string().contains("currently in use"));
-        assert!(app.paths().share_dir(result.share_id).is_dir());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn initial_sync_propagates_removed_share_state_errors() {
-        let temporary = TempDir::new().unwrap();
-        let root = temporary.path().join("workspace");
-        fs::create_dir_all(&root).unwrap();
-        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
-        let result = app.init(&root, None).unwrap();
-        let identity = identity::load_or_create(app.paths()).unwrap();
-        app.paths().remove_share_state(result.share_id).unwrap();
-
-        let error = network::attempt_initial_sync(app.paths().clone(), identity, result.share_id)
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("unable to inspect"));
-    }
-
-    #[test]
-    fn same_directory_cannot_be_registered_twice() {
-        let temporary = TempDir::new().unwrap();
-        let root = temporary.path().join("workspace");
-        fs::create_dir_all(&root).unwrap();
-        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
-        app.init(&root, None).unwrap();
-        let error = app.init(&root, None).unwrap_err();
-        assert!(error.to_string().contains("already registered"));
-    }
-
-    #[test]
-    fn nested_directories_cannot_be_registered_as_separate_shares() {
-        let temporary = TempDir::new().unwrap();
-        let root = temporary.path().join("workspace");
-        let nested = root.join("nested");
-        fs::create_dir_all(&nested).unwrap();
-        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
-        app.init(&root, None).unwrap();
-        let error = app.init(&nested, None).unwrap_err();
-        assert!(error.to_string().contains("already registered"));
-    }
-
-    #[test]
-    fn application_data_directory_cannot_be_a_share() {
-        let temporary = TempDir::new().unwrap();
-        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
-        let data_root = app.paths().root().to_path_buf();
-        let error = app.init(&data_root, None).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("overlaps the Syncbox application data directory")
-        );
-        assert!(!app.paths().identity_dir().exists());
-        assert!(!app.paths().shares_dir().exists());
-    }
-
-    #[test]
-    fn data_directory_inside_a_share_is_rejected_before_state_is_created() {
-        let temporary = TempDir::new().unwrap();
-        let shared_directory = temporary.path().join("workspace");
-        fs::create_dir_all(&shared_directory).unwrap();
-        let app = App::with_paths(DataPaths::from_root(shared_directory.join("state")));
-        let error = app.init(&shared_directory, None).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("overlaps the Syncbox application data directory")
-        );
-        assert!(!shared_directory.join("state/identity").exists());
-        assert!(!shared_directory.join("state/shares").exists());
-    }
-
-    #[test]
-    fn multiple_shares_use_one_device_identity_and_independent_state() {
-        let temporary = TempDir::new().unwrap();
-        let first_directory = temporary.path().join("first");
-        let second_directory = temporary.path().join("second");
-        fs::create_dir_all(&first_directory).unwrap();
-        fs::create_dir_all(&second_directory).unwrap();
-        fs::write(first_directory.join("one.txt"), "one").unwrap();
-        fs::write(second_directory.join("two.txt"), "two").unwrap();
-        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
-        let first = app.init(&first_directory, Some("first")).unwrap();
-        let second = app.init(&second_directory, Some("second")).unwrap();
-        assert_ne!(first.share_id, second.share_id);
-        assert_eq!(first.endpoint_id, second.endpoint_id);
-        let report = app.status(None).unwrap();
-        assert_eq!(report.shares.len(), 2);
-        assert!(app.paths().share_manifest(first.share_id).exists());
-        assert!(app.paths().share_manifest(second.share_id).exists());
-    }
-
-    #[test]
-    fn stale_runtime_status_is_reported_as_stopped() {
-        let temporary = TempDir::new().unwrap();
-        let directory = temporary.path().join("workspace");
-        fs::create_dir_all(&directory).unwrap();
-        let app = App::with_paths(DataPaths::from_root(temporary.path().join("data")));
-        let result = app.init(&directory, None).unwrap();
-        let _lock = app.paths().acquire_share_lock(result.share_id).unwrap();
-        let mut runtime = RuntimeStatus::stopped(0);
-        runtime.process_id = std::process::id();
-        runtime.state = RuntimeState::Running;
-        runtime.heartbeat_at_ms = 0;
-        app.paths()
-            .save_runtime_status(result.share_id, &runtime)
-            .unwrap();
-        let report = app.status(Some(&result.share_id.to_string())).unwrap();
-        assert_eq!(report.shares[0].runtime, "stopped");
-    }
-}
+mod tests;

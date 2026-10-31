@@ -1,6 +1,13 @@
+//! Persistent application state.
+//!
+//! All durable state goes through [`DataPaths`], which owns layout, validation, locking, and
+//! atomic replacement. The implementation is split into:
+//!
+//! - `locks`: advisory file locks used to serialize device and per-share work.
+//! - `atomic`: bounded reads, private permissions, and atomic file replacement.
+
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -9,15 +16,23 @@ use anyhow::{Context, Result, anyhow, bail};
 use directories_next::BaseDirs;
 use fs4::{FileExt, TryLockError};
 use rand::RngExt as _;
-use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
     manifest::Manifest,
     types::{ClockState, KnownPeers, RuntimeStatus, ShareConfig, ShareId},
 };
 
-const SMALL_STATE_MAX_BYTES: u64 = 1024 * 1024;
-const MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
+mod atomic;
+mod locks;
+
+use atomic::{
+    atomic_write, atomic_write_json, create_secure_dir, read_bounded, read_json,
+    sync_parent_directory,
+};
+use locks::{acquire_lock, create_lock_file, try_acquire_lock};
+
+pub(crate) const SMALL_STATE_MAX_BYTES: u64 = 1024 * 1024;
+pub(crate) const MANIFEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const IDENTITY_KEY_BYTES: u64 = 32;
 
 #[derive(Clone, Debug)]
@@ -447,350 +462,5 @@ impl DataPaths {
     }
 }
 
-fn create_secure_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .with_context(|| format!("unable to create data directory {}", path.display()))?;
-    set_dir_permissions(path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_dir_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("unable to set permissions on {}", path.display()))
-}
-
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
-const fn set_dir_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-fn create_lock_file(path: &Path) -> Result<()> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("unable to create lock file {}", path.display()))?;
-    set_file_permissions(&file, true)?;
-    Ok(())
-}
-
-fn acquire_lock(path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("unable to open lock file {}", path.display()))?;
-    FileExt::lock(&file).with_context(|| format!("unable to lock {}", path.display()))?;
-    Ok(file)
-}
-
-fn try_acquire_lock(path: &Path) -> Result<Option<File>> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("unable to open lock file {}", path.display()))?;
-    match FileExt::try_lock(&file) {
-        Ok(()) => Ok(Some(file)),
-        Err(TryLockError::WouldBlock) => Ok(None),
-        Err(TryLockError::Error(error)) => {
-            Err(error).with_context(|| format!("unable to lock {}", path.display()))
-        }
-    }
-}
-
-fn read_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    let metadata =
-        fs::metadata(path).with_context(|| format!("unable to inspect {}", path.display()))?;
-    if !metadata.is_file() {
-        bail!("{} is not a regular file", path.display());
-    }
-    if metadata.len() > max_bytes {
-        bail!(
-            "{} exceeds the maximum supported size of {} bytes",
-            path.display(),
-            max_bytes
-        );
-    }
-    let mut file =
-        File::open(path).with_context(|| format!("unable to open {}", path.display()))?;
-    let capacity = usize::try_from(metadata.len())
-        .with_context(|| format!("{} is too large for this platform", path.display()))?;
-    let mut data = Vec::with_capacity(capacity);
-    file.read_to_end(&mut data)
-        .with_context(|| format!("unable to read {}", path.display()))?;
-    if data.len() as u64 > max_bytes {
-        bail!("{} grew beyond its maximum supported size", path.display());
-    }
-    Ok(data)
-}
-
-fn read_json<T: DeserializeOwned>(path: &Path, max_bytes: u64) -> Result<T> {
-    let bytes = read_bounded(path, max_bytes)?;
-    serde_json::from_slice(&bytes).with_context(|| format!("unable to parse {}", path.display()))
-}
-
-fn atomic_write_json<T: Serialize>(path: &Path, value: &T, private: bool) -> Result<()> {
-    atomic_write_with(path, private, |file| {
-        let mut writer = BufWriter::with_capacity(64 * 1024, file);
-        serde_json::to_writer(&mut writer, value)
-            .context("unable to serialize persistent state")?;
-        writer.write_all(b"\n")?;
-        writer
-            .flush()
-            .context("unable to flush persistent state buffer")
-    })
-}
-
-fn atomic_write(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
-    atomic_write_with(path, private, |file| {
-        file.write_all(bytes)
-            .context("unable to write persistent state")
-    })
-}
-
-fn atomic_write_with(
-    path: &Path,
-    private: bool,
-    write: impl FnOnce(&mut File) -> Result<()>,
-) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("persistent state path has no parent"))?;
-    create_secure_dir(parent)?;
-
-    let suffix: u64 = rand::rng().random();
-    let temporary = parent.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("syncbox-state"),
-        std::process::id(),
-        suffix
-    ));
-
-    let write_result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .with_context(|| {
-                format!(
-                    "unable to create temporary state file {}",
-                    temporary.display()
-                )
-            })?;
-        set_file_permissions(&file, private)?;
-        write(&mut file).with_context(|| {
-            format!(
-                "unable to write temporary state file {}",
-                temporary.display()
-            )
-        })?;
-        file.sync_all().with_context(|| {
-            format!(
-                "unable to flush temporary state file {}",
-                temporary.display()
-            )
-        })?;
-        drop(file);
-        atomic_replace(&temporary, path).with_context(|| {
-            format!(
-                "unable to atomically replace persistent state {}",
-                path.display()
-            )
-        })?;
-        sync_parent_directory(parent)?;
-        Ok(())
-    })();
-
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    write_result
-}
-
-#[cfg(unix)]
-fn set_file_permissions(file: &File, _private: bool) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .context("unable to set persistent state file permissions")
-}
-
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
-const fn set_file_permissions(_file: &File, _private: bool) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn atomic_replace(temporary: &Path, target: &Path) -> std::io::Result<()> {
-    fs::rename(temporary, target)
-}
-
-#[cfg(windows)]
-fn atomic_replace(temporary: &Path, target: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let temporary_wide = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let target_wide = target
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
-    // Both paths include a trailing NUL and remain alive through the system call.
-    #[allow(unsafe_code)]
-    let result = unsafe { MoveFileExW(temporary_wide.as_ptr(), target_wide.as_ptr(), flags) };
-    if result == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_parent_directory(parent: &Path) -> Result<()> {
-    File::open(parent)
-        .with_context(|| format!("unable to open state directory {}", parent.display()))?
-        .sync_all()
-        .with_context(|| format!("unable to flush state directory {}", parent.display()))
-}
-
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)]
-const fn sync_parent_directory(_parent: &Path) -> Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
-mod tests {
-    use tempfile::TempDir;
-
-    use super::*;
-
-    #[test]
-    fn state_file_replacement_keeps_the_latest_complete_value() {
-        let temporary = TempDir::new().unwrap();
-        let paths = DataPaths::from_root(temporary.path().join("data"));
-        paths.ensure_layout().unwrap();
-        let path = paths.root().join("state.json");
-        paths.write_file_atomically(&path, b"first", true).unwrap();
-        paths.write_file_atomically(&path, b"second", true).unwrap();
-        assert_eq!(fs::read(path).unwrap(), b"second");
-    }
-
-    #[test]
-    fn failed_streamed_state_write_preserves_the_previous_value() {
-        let temporary = TempDir::new().unwrap();
-        let path = temporary.path().join("state.json");
-        atomic_write(&path, b"previous", true).unwrap();
-        let result = atomic_write_with(&path, true, |file| {
-            file.write_all(b"incomplete")?;
-            bail!("interrupted serialization")
-        });
-        assert!(result.is_err());
-        assert_eq!(fs::read(&path).unwrap(), b"previous");
-        assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn invalid_share_directories_are_not_registered_shares() {
-        let temporary = TempDir::new().unwrap();
-        let paths = DataPaths::from_root(temporary.path().join("data"));
-        paths.ensure_layout().unwrap();
-        fs::create_dir(paths.shares_dir().join("not-a-share")).unwrap();
-        assert_eq!(
-            paths.list_share_ids().unwrap(),
-            Vec::<crate::types::ShareId>::new()
-        );
-    }
-
-    #[test]
-    fn removing_share_state_preserves_other_directories() {
-        let temporary = TempDir::new().unwrap();
-        let paths = DataPaths::from_root(temporary.path().join("data"));
-        let share_id = ShareId::random();
-        let other_share_id = ShareId::random();
-        let shared_directory = temporary.path().join("shared");
-        fs::create_dir(&shared_directory).unwrap();
-        fs::write(shared_directory.join("keep.txt"), "keep").unwrap();
-        paths.ensure_share_layout(share_id).unwrap();
-        paths.ensure_share_layout(other_share_id).unwrap();
-        fs::write(paths.share_config(share_id), "private state").unwrap();
-
-        paths.remove_share_state(share_id).unwrap();
-
-        assert!(!paths.share_dir(share_id).exists());
-        assert!(paths.share_dir(other_share_id).is_dir());
-        assert_eq!(
-            fs::read_to_string(shared_directory.join("keep.txt")).unwrap(),
-            "keep"
-        );
-        assert_eq!(paths.list_share_ids().unwrap(), vec![other_share_id]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn removing_share_state_rejects_a_symlink() {
-        use std::os::unix::fs::symlink;
-
-        let temporary = TempDir::new().unwrap();
-        let paths = DataPaths::from_root(temporary.path().join("data"));
-        let share_id = ShareId::random();
-        let outside = temporary.path().join("outside");
-        paths.ensure_layout().unwrap();
-        fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("keep.txt"), "keep").unwrap();
-        symlink(&outside, paths.share_dir(share_id)).unwrap();
-
-        let error = paths.remove_share_state(share_id).unwrap_err().to_string();
-
-        assert!(error.contains("is not a directory"));
-        assert_eq!(
-            fs::read_to_string(outside.join("keep.txt")).unwrap(),
-            "keep"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn removing_share_state_rejects_a_symlinked_shares_parent() {
-        use std::os::unix::fs::symlink;
-
-        let temporary = TempDir::new().unwrap();
-        let data_root = temporary.path().join("data");
-        let outside = temporary.path().join("outside");
-        let paths = DataPaths::from_root(data_root.clone());
-        let share_id = ShareId::random();
-        fs::create_dir_all(&data_root).unwrap();
-        fs::create_dir(&outside).unwrap();
-        fs::create_dir(outside.join(share_id.to_string())).unwrap();
-        fs::write(outside.join(share_id.to_string()).join("keep.txt"), "keep").unwrap();
-        symlink(&outside, data_root.join("shares")).unwrap();
-
-        let error = paths.remove_share_state(share_id).unwrap_err().to_string();
-
-        assert!(error.contains("registered shares path"));
-        assert!(outside.join(share_id.to_string()).is_dir());
-        assert_eq!(
-            fs::read_to_string(outside.join(share_id.to_string()).join("keep.txt")).unwrap(),
-            "keep"
-        );
-    }
-}
+mod tests;

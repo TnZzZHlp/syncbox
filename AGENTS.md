@@ -7,12 +7,24 @@ Syncbox is a Rust 2024 command-line application for synchronizing multiple indep
 ## Repository layout
 
 - `src/main.rs`: Clap CLI entry point and command dispatch.
-- `src/app.rs`: application workflows for init, join, run, scan, status, and tickets.
-- `src/network.rs`: Iroh transport, peer authentication, synchronization, and chunk transfers.
-- `src/manifest.rs`: directory scanning, hashes, metadata, versions, and merge logic.
-- `src/storage.rs`: platform data paths, locks, validation, and atomic persistent-state writes.
-- `src/identity.rs`, `src/ticket.rs`, `src/types.rs`: device identity, ShareTickets, and shared data types.
-- `tests/cli.rs`: CLI integration tests; service templates are under `packaging/`.
+- `src/app/`: application workflows for init, join, run, scan, status, and tickets.
+  - `mod.rs`: `App` orchestration and command result types.
+  - `directory.rs`: shared-directory normalization and isolation checks.
+  - `status.rs`: runtime assessment, JSON status records, and human-readable output.
+- `src/network/`: Iroh transport, peer authentication, synchronization, and chunk transfers.
+  - `mod.rs`: `run` entry point and the public `InitialSyncStatus`/`attempt_initial_sync` surface.
+  - `client.rs`, `incoming.rs`: outbound and inbound synchronization paths.
+  - `wire.rs`, `auth.rs`: protocol messages, their validation, and per-stream authentication.
+  - `state.rs`, `registry.rs`, `scheduling.rs`, `lifecycle.rs`: share state, peer scheduling, and runtime loops.
+  - `transfer.rs`, `local.rs`: transfer planning/chunking and shared-directory writes.
+  - `transport.rs`, `io.rs`, `diagnostics.rs`, `connectivity.rs`: Iroh plumbing.
+- `src/manifest/`: directory scanning, hashes, metadata, versions, and merge logic.
+  - `model.rs`, `scan.rs`, `path.rs`, `merge.rs`.
+- `src/storage/`: platform data paths, locks, validation, and atomic persistent-state writes.
+  - `mod.rs` (`DataPaths`), `atomic.rs`, `locks.rs`.
+- `src/identity/`, `src/ticket/`, `src/types/`, `src/chunk/`, `src/frame/`, `src/runtime/`: device identity, ShareTickets, shared data types, and framing/state helpers.
+- `tests/cli.rs`: CLI integration tests. `tests/types.rs` and `tests/ticket.rs` cover public library behavior; service templates are under `packaging/`.
+- Module unit tests that need private access stay beside their module, split by concern (for example `src/network/tests/`, `src/app/tests/`, `src/manifest/tests/`, `src/storage/tests/`).
 
 ## Development commands
 

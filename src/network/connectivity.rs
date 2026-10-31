@@ -8,7 +8,7 @@ use tokio::{
 };
 use tracing::info;
 
-use super::ShareRegistry;
+use super::registry::ShareRegistry;
 
 const RECOVERY_COOLDOWN: Duration = Duration::from_secs(5);
 
