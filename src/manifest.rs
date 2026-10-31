@@ -883,7 +883,7 @@ fn relative_manifest_path(root: &Path, path: &Path) -> Result<String> {
     let relative = path
         .strip_prefix(root)
         .with_context(|| format!("scanned path {} is outside its root", path.display()))?;
-    let mut parts = Vec::new();
+    let mut value = String::with_capacity(relative.as_os_str().len());
     for component in relative.components() {
         match component {
             Component::Normal(component) => {
@@ -893,12 +893,14 @@ fn relative_manifest_path(root: &Path, path: &Path) -> Result<String> {
                 if component.is_empty() || component.contains('\\') || component.contains('/') {
                     bail!("local file name cannot be represented safely in a manifest");
                 }
-                parts.push(component);
+                if !value.is_empty() {
+                    value.push('/');
+                }
+                value.push_str(component);
             }
             _ => bail!("local file path cannot be represented safely in a manifest"),
         }
     }
-    let value = parts.join("/");
     validate_manifest_path(&value)?;
     Ok(value)
 }
