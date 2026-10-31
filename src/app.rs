@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::{
     identity,
-    manifest::{Manifest, current_time_ms, scan_manifest},
+    manifest::{Manifest, current_time_ms, scan_manifest, scan_manifest_cached_after_validation},
     network,
     storage::DataPaths,
     ticket::ShareTicket,
@@ -284,7 +284,13 @@ impl App {
         let manifest = self.paths.load_manifest(share_id)?;
         let clock = self.paths.load_clock(share_id)?;
         let now_ms = current_time_ms();
-        let scanned = scan_manifest(&root, &manifest, clock, &identity.endpoint_id(), now_ms)?;
+        let scanned = scan_manifest_cached_after_validation(
+            &root,
+            &manifest,
+            clock,
+            &identity.endpoint_id(),
+            now_ms,
+        )?;
         if scanned.changes > 0 {
             self.paths.save_clock(share_id, &scanned.clock)?;
         }

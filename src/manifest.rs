@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
@@ -20,6 +21,7 @@ pub const MANIFEST_FORMAT_VERSION: u16 = 3;
 const PREVIOUS_MANIFEST_FORMAT_VERSION: u16 = 2;
 const LEGACY_MANIFEST_FORMAT_VERSION: u16 = 1;
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
+const MAX_CACHED_AUTHORS: usize = 256;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -284,7 +286,6 @@ impl Tombstone {
 }
 
 thread_local! {
-    // ponytail: bounded positive cache; use per-manifest deduplication if authors exceed 64 per thread.
     static VALID_AUTHORS: RefCell<Vec<[u8; 32]>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -296,10 +297,9 @@ fn validate_timestamp(timestamp: &HlcTimestamp) -> Result<()> {
         .map_err(|_| anyhow!("manifest has an invalid HLC author"))?;
     VALID_AUTHORS.with(|authors| {
         let mut authors = authors.borrow_mut();
-        if authors.len() == 64 {
-            authors.clear();
+        if authors.len() < MAX_CACHED_AUTHORS {
+            authors.push(timestamp.author);
         }
-        authors.push(timestamp.author);
     });
     Ok(())
 }
@@ -353,8 +353,8 @@ impl ManifestRecord {
     }
 }
 
-pub struct ScanResult {
-    pub manifest: Manifest,
+pub struct ScanResult<M = Manifest> {
+    pub manifest: M,
     pub clock: ClockState,
     pub files: usize,
     pub tombstones: usize,
@@ -368,15 +368,48 @@ pub struct ScanResult {
 pub fn scan_manifest(
     root: &Path,
     previous: &Manifest,
-    mut clock: ClockState,
+    clock: ClockState,
     endpoint_id: &EndpointId,
     now_ms: u64,
 ) -> Result<ScanResult> {
     previous.validate(previous.share_id)?;
+    let scanned =
+        scan_manifest_cached_after_validation(root, previous, clock, endpoint_id, now_ms)?;
+    let mut manifest = scanned.manifest.into_owned();
+    manifest.scanned_at_ms = now_ms;
+    Ok(ScanResult {
+        manifest,
+        clock: scanned.clock,
+        files: scanned.files,
+        tombstones: scanned.tombstones,
+        changes: scanned.changes,
+        changed: scanned.changed,
+        manifest_changed: scanned.manifest_changed,
+    })
+}
+
+pub(crate) fn scan_manifest_cached_after_validation<'a>(
+    root: &Path,
+    previous: &'a Manifest,
+    mut clock: ClockState,
+    endpoint_id: &EndpointId,
+    now_ms: u64,
+) -> Result<ScanResult<Cow<'a, Manifest>>> {
     clock.validate()?;
     // Windows manifests have no POSIX permissions; only legacy manifests should synthesize them.
     let unknown_permissions_match = previous.format_version != LEGACY_MANIFEST_FORMAT_VERSION;
     let discovered = discover_entries(root, previous, unknown_permissions_match)?;
+    if discovered.matches_previous(previous, unknown_permissions_match) {
+        return Ok(ScanResult {
+            manifest: Cow::Borrowed(previous),
+            clock,
+            files: previous.entries.len(),
+            tombstones: previous.tombstones.len(),
+            changes: 0,
+            changed: false,
+            manifest_changed: false,
+        });
+    }
     let mut entries = BTreeMap::new();
     let mut directories = BTreeMap::new();
     // Windows follows Syncthing's policy: remote symlinks remain as unsupported index state
@@ -515,7 +548,7 @@ pub fn scan_manifest(
     Ok(ScanResult {
         files: manifest.entries.len(),
         tombstones: manifest.tombstones.len(),
-        manifest,
+        manifest: Cow::Owned(manifest),
         clock,
         changes,
         changed: changes > 0,
@@ -543,6 +576,53 @@ struct DiscoveredEntries {
     files: BTreeMap<String, DiscoveredFile>,
     directories: BTreeMap<String, DiscoveredDirectory>,
     symlinks: BTreeMap<String, DiscoveredSymlink>,
+}
+
+impl DiscoveredEntries {
+    fn matches_previous(&self, previous: &Manifest, unknown_permissions_match: bool) -> bool {
+        if previous.format_version != MANIFEST_FORMAT_VERSION
+            || previous.entries.len() != self.files.len()
+            || previous.directories.len() != self.directories.len()
+            || !previous
+                .entries
+                .iter()
+                .zip(&self.files)
+                .all(|((old_path, old), (path, file))| {
+                    old_path == path
+                        && old.size == file.size
+                        && old.modified_at_ns == file.modified_at_ns
+                        && old.sha256 == file.sha256
+                        && permissions_match(
+                            old.permissions,
+                            file.permissions,
+                            unknown_permissions_match,
+                        )
+                })
+            || !previous.directories.iter().zip(&self.directories).all(
+                |((old_path, old), (path, directory))| {
+                    old_path == path
+                        && permissions_match(
+                            old.permissions,
+                            directory.permissions,
+                            unknown_permissions_match,
+                        )
+                },
+            )
+        {
+            return false;
+        }
+        #[cfg(windows)]
+        {
+            self.symlinks.is_empty()
+        }
+        #[cfg(not(windows))]
+        {
+            previous.symlinks.len() == self.symlinks.len()
+                && previous.symlinks.iter().zip(&self.symlinks).all(
+                    |((old_path, old), (path, link))| old_path == path && old.target == link.target,
+                )
+        }
+    }
 }
 
 fn discover_entries(
@@ -915,14 +995,16 @@ mod tests {
         };
         assert!(validate_timestamp(&invalid).is_err());
         assert!(validate_timestamp(&invalid).is_err());
-        for byte in 0..=64 {
+        for index in 0_u64..300 {
+            let mut seed = [0_u8; 32];
+            seed[..8].copy_from_slice(&index.to_le_bytes());
             let author = HlcTimestamp {
-                author: *SecretKey::from_bytes(&[byte; 32]).public().as_bytes(),
+                author: *SecretKey::from_bytes(&seed).public().as_bytes(),
                 ..valid
             };
             validate_timestamp(&author).unwrap();
         }
-        VALID_AUTHORS.with(|authors| assert!(authors.borrow().len() <= 64));
+        VALID_AUTHORS.with(|authors| assert_eq!(authors.borrow().len(), MAX_CACHED_AUTHORS));
         assert!(validate_timestamp(&invalid).is_err());
     }
 
@@ -972,6 +1054,50 @@ mod tests {
             assert_eq!(entry.version.wall_ms, 2);
             assert_eq!(entry.version.counter, u32::try_from(counter).unwrap());
         }
+    }
+
+    #[test]
+    fn scanner_rejects_invalid_previous_state_before_reuse() {
+        let temporary = TempDir::new().unwrap();
+        let share_id = ShareId([30; 32]);
+        let endpoint = SecretKey::from_bytes(&[31; 32]).public();
+        let mut previous = Manifest::empty(share_id, 1);
+        previous.format_version = u16::MAX;
+        assert!(
+            scan_manifest(temporary.path(), &previous, ClockState::new(), &endpoint, 2).is_err()
+        );
+    }
+
+    #[test]
+    fn equal_record_counts_do_not_hide_a_renamed_file() {
+        let temporary = TempDir::new().unwrap();
+        fs::write(temporary.path().join("before"), "content").unwrap();
+        let share_id = ShareId([28; 32]);
+        let endpoint = SecretKey::from_bytes(&[29; 32]).public();
+        let first = scan_manifest(
+            temporary.path(),
+            &Manifest::empty(share_id, 1),
+            ClockState::new(),
+            &endpoint,
+            2,
+        )
+        .unwrap();
+        fs::rename(
+            temporary.path().join("before"),
+            temporary.path().join("after"),
+        )
+        .unwrap();
+        let renamed = scan_manifest_cached_after_validation(
+            temporary.path(),
+            &first.manifest,
+            first.clock,
+            &endpoint,
+            3,
+        )
+        .unwrap();
+        assert_eq!(renamed.changes, 2);
+        assert!(renamed.manifest.entries.contains_key("after"));
+        assert!(renamed.manifest.tombstones.contains_key("before"));
     }
 
     #[test]

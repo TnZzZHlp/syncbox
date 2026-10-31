@@ -37,8 +37,8 @@ use crate::{
     frame,
     identity::DeviceIdentity,
     manifest::{
-        Manifest, ManifestRecordRef, current_time_ms, path_for_manifest, scan_manifest,
-        select_record, validate_manifest_path,
+        Manifest, ManifestRecordRef, current_time_ms, path_for_manifest,
+        scan_manifest_cached_after_validation, select_record, validate_manifest_path,
     },
     runtime::RuntimeStatusCache,
     storage::DataPaths,
@@ -2304,7 +2304,7 @@ fn scan_and_save(share: &Arc<ActiveShare>, config: &ShareConfig) -> Result<()> {
     let snapshot = share.manifest_snapshot()?;
     let clock = share.paths.load_clock(share.share_id)?;
     let now_ms = current_time_ms();
-    let scanned = scan_manifest(
+    let scanned = scan_manifest_cached_after_validation(
         &root,
         &snapshot.manifest,
         clock,
@@ -2326,7 +2326,7 @@ fn scan_and_save(share: &Arc<ActiveShare>, config: &ShareConfig) -> Result<()> {
         share.paths.save_clock(share.share_id, &scanned.clock)?;
     }
     if scanned.manifest_changed {
-        share.save_manifest(scanned.manifest)?;
+        share.save_manifest(scanned.manifest.into_owned())?;
     }
     update_runtime(share, |status, _| {
         status.last_scan_at_ms = Some(now_ms);
@@ -4001,7 +4001,7 @@ mod tests {
         assert!(!root.join("alias.txt").exists());
         let stored = share.paths.load_manifest(share_id).unwrap();
         assert_eq!(stored.symlinks, remote.symlinks);
-        let scanned = scan_manifest(
+        let scanned = crate::manifest::scan_manifest(
             &root,
             &stored,
             share.paths.load_clock(share_id).unwrap(),
