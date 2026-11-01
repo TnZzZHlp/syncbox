@@ -188,6 +188,40 @@ fn download_resume_checks_are_limited_to_the_selected_batch() {
 }
 
 #[test]
+fn transfer_planning_does_not_treat_directories_as_matching_file_content() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("share");
+    fs::create_dir(&root).unwrap();
+    let share_id = ShareId([104; 32]);
+    let endpoint = SecretKey::from_bytes(&[105; 32]).public();
+    let mut local = Manifest::empty(share_id, 1);
+    let mut remote = Manifest::empty(share_id, 2);
+    let file = ManifestEntry {
+        size: 1,
+        modified_at_ns: 0,
+        sha256: "a".repeat(64),
+        permissions: None,
+        version: timestamp(2, endpoint),
+    };
+    let directory = crate::manifest::DirectoryEntry {
+        permissions: None,
+        version: timestamp(1, endpoint),
+    };
+    local.entries.insert("upload".to_owned(), file.clone());
+    remote.entries.insert("download".to_owned(), file);
+    local
+        .directories
+        .insert("download".to_owned(), directory.clone());
+    remote.directories.insert("upload".to_owned(), directory);
+    let share = active_share(&root, local.clone(), endpoint);
+    let (request, pending) = make_transfer_request(&share, &local, &remote).unwrap();
+    assert_eq!(request.download_paths, ["download"]);
+    assert_eq!(request.uploads.len(), 1);
+    assert_eq!(request.uploads[0].path, "upload");
+    assert_eq!(pending, 0);
+}
+
+#[test]
 fn capped_uploads_keep_the_remaining_update_count() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("share");

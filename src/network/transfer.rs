@@ -54,11 +54,14 @@ pub fn make_transfer_request(
     let mut download_resumes = Vec::new();
     for (path, remote_entry) in &remote.entries {
         let remote_record = ManifestRecordRef::File(remote_entry);
-        if matches!(select_record(local.record(path), Some(remote_record)), Some(selected) if selected.version() == remote_record.version() && selected.is_tombstone() == remote_record.is_tombstone())
+        let local_record = local.record(path);
+        if matches!(select_record(local_record, Some(remote_record)), Some(selected) if selected.version() == remote_record.version() && selected.is_tombstone() == remote_record.is_tombstone())
         {
-            let local_content_matches = local.entries.get(path).is_some_and(|entry| {
-                entry.size == remote_entry.size && entry.sha256 == remote_entry.sha256
-            });
+            let local_content_matches = matches!(
+                local_record,
+                Some(ManifestRecordRef::File(entry))
+                    if entry.size == remote_entry.size && entry.sha256 == remote_entry.sha256
+            );
             if !local_content_matches {
                 download_paths.push(path.clone());
                 download_resumes.push(TransferFile {
@@ -77,11 +80,14 @@ pub fn make_transfer_request(
     let mut requested_uploads = 0_usize;
     for (path, local_entry) in &local.entries {
         let local_record = ManifestRecordRef::File(local_entry);
-        let selected = select_record(Some(local_record), remote.record(path));
+        let remote_record = remote.record(path);
+        let selected = select_record(Some(local_record), remote_record);
         let local_wins = matches!(selected, Some(winner) if winner.version() == local_record.version() && !winner.is_tombstone());
-        let remote_content_matches = remote.entries.get(path).is_some_and(|entry| {
-            entry.size == local_entry.size && entry.sha256 == local_entry.sha256
-        });
+        let remote_content_matches = matches!(
+            remote_record,
+            Some(ManifestRecordRef::File(entry))
+                if entry.size == local_entry.size && entry.sha256 == local_entry.sha256
+        );
         if local_wins && !remote_content_matches {
             requested_uploads += 1;
             if uploads.len() < MAX_TRANSFER_FILES {
