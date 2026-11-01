@@ -46,11 +46,18 @@ impl ShareId {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    fn hex_bytes(self) -> [u8; Self::HEX_LENGTH] {
+        let mut bytes = [0_u8; Self::HEX_LENGTH];
+        hex::encode_to_slice(self.0, &mut bytes).expect("share ID encodes to 64 hexadecimal bytes");
+        bytes
+    }
 }
 
 impl fmt::Display for ShareId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&hex::encode(self.0))
+        let bytes = self.hex_bytes();
+        formatter.write_str(std::str::from_utf8(&bytes).expect("hexadecimal encoding is ASCII"))
     }
 }
 
@@ -65,7 +72,9 @@ impl Serialize for ShareId {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        let bytes = self.hex_bytes();
+        serializer
+            .serialize_str(std::str::from_utf8(&bytes).expect("hexadecimal encoding is ASCII"))
     }
 }
 
