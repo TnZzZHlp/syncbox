@@ -147,10 +147,7 @@ async fn due_peers(
     share: &Arc<ActiveShare>,
     active: &HashSet<EndpointId>,
 ) -> Result<Vec<EndpointId>> {
-    let mut peers = share
-        .paths
-        .load_known_peers(share.share_id)?
-        .endpoint_ids()?;
+    let mut peers = share.paths.load_known_peer_ids(share.share_id)?;
     peers.retain(|peer| *peer != share.local_endpoint_id);
     let generation = share.manifest_generation.load(Ordering::Relaxed);
     let mut schedules = share.peer_schedule.lock().await;

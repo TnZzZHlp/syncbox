@@ -274,26 +274,37 @@ impl KnownPeers {
     }
 
     pub fn add_or_touch(&mut self, endpoint_id: &EndpointId, now_ms: u64) {
+        if self.add_or_touch_unsorted(endpoint_id, now_ms) {
+            self.peers
+                .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+        }
+    }
+
+    fn add_or_touch_unsorted(&mut self, endpoint_id: &EndpointId, now_ms: u64) -> bool {
         let value = endpoint_id_string(endpoint_id);
         if let Some(existing) = self.peers.iter_mut().find(|peer| peer.endpoint_id == value) {
             existing.last_seen_at_ms = Some(now_ms);
-            return;
+            return false;
         }
         self.peers.push(PeerRecord {
             endpoint_id: value,
             added_at_ms: now_ms,
             last_seen_at_ms: Some(now_ms),
         });
-        self.peers
-            .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+        true
     }
 
     pub fn merge_endpoint_ids<I>(&mut self, endpoint_ids: I, now_ms: u64)
     where
         I: IntoIterator<Item = EndpointId>,
     {
+        let mut inserted = false;
         for endpoint_id in endpoint_ids {
-            self.add_or_touch(&endpoint_id, now_ms);
+            inserted |= self.add_or_touch_unsorted(&endpoint_id, now_ms);
+        }
+        if inserted {
+            self.peers
+                .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
         }
     }
 }

@@ -207,9 +207,11 @@ fn update_digest_permissions(hasher: &mut blake3::Hasher, permissions: Option<u1
 }
 
 fn update_digest_timestamp(hasher: &mut blake3::Hasher, timestamp: HlcTimestamp) {
-    hasher.update(&timestamp.wall_ms.to_be_bytes());
-    hasher.update(&timestamp.counter.to_be_bytes());
-    hasher.update(&timestamp.author);
+    let mut bytes = [0_u8; 44];
+    bytes[..8].copy_from_slice(&timestamp.wall_ms.to_be_bytes());
+    bytes[8..12].copy_from_slice(&timestamp.counter.to_be_bytes());
+    bytes[12..].copy_from_slice(&timestamp.author);
+    hasher.update(&bytes);
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

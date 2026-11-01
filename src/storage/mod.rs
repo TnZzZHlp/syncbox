@@ -15,6 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 #[cfg(not(unix))]
 use directories_next::BaseDirs;
 use fs4::{FileExt, TryLockError};
+use iroh::EndpointId;
 use rand::RngExt as _;
 
 use crate::{
@@ -425,6 +426,12 @@ impl DataPaths {
             read_json(&self.share_known_peers(share_id), SMALL_STATE_MAX_BYTES)?;
         peers.validate()?;
         Ok(peers)
+    }
+
+    pub fn load_known_peer_ids(&self, share_id: ShareId) -> Result<Vec<EndpointId>> {
+        let peers: KnownPeers =
+            read_json(&self.share_known_peers(share_id), SMALL_STATE_MAX_BYTES)?;
+        peers.endpoint_ids()
     }
 
     pub fn save_known_peers(&self, share_id: ShareId, peers: &KnownPeers) -> Result<()> {

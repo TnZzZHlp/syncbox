@@ -14,6 +14,129 @@ fn resized_partial_preserves_prefix_and_returns_a_zero_positioned_handle() {
 }
 
 #[test]
+fn partial_creation_recovers_missing_parent_directories() {
+    let temporary = TempDir::new().unwrap();
+    let path = temporary.path().join("missing/nested/partial");
+    let file = ensure_partial_file(&path, 0).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), 0);
+    assert!(path.is_file());
+}
+
+#[test]
+fn ordered_resume_lookup_preserves_metadata_matching_and_unordered_input() {
+    let share_id = ShareId([82; 32]);
+    let endpoint = SecretKey::from_bytes(&[83; 32]).public();
+    let mut manifest = Manifest::empty(share_id, 1);
+    let mut paths = Vec::new();
+    let mut resumes = Vec::new();
+    for index in 0..MAX_TRANSFER_FILES {
+        let path = format!("file-{index:03}");
+        if index + 1 < MAX_TRANSFER_FILES {
+            manifest.entries.insert(
+                path.clone(),
+                ManifestEntry {
+                    size: 1024,
+                    modified_at_ns: 0,
+                    sha256: "a".repeat(64),
+                    permissions: None,
+                    version: timestamp(1, endpoint),
+                },
+            );
+        }
+        paths.push(path.clone());
+        resumes.push(TransferFile {
+            path,
+            sha256: if index == 0 { "b" } else { "a" }.repeat(64),
+            size: if index == 1 { 1025 } else { 1024 },
+            offset: index as u64 + 1,
+        });
+    }
+    for _ in 0..2 {
+        let files = build_transfer_files(&manifest, &paths, &resumes).unwrap();
+        assert_eq!(files.len(), MAX_TRANSFER_FILES - 1);
+        for (index, file) in files.iter().enumerate() {
+            let expected = if index < 2 { 0 } else { index as u64 + 1 };
+            assert_eq!(file.offset, expected);
+        }
+        resumes.reverse();
+    }
+}
+
+#[test]
+fn staged_transfer_installs_verified_content_and_cleans_the_partial() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("share");
+    fs::create_dir(&root).unwrap();
+    let share_id = ShareId([89; 32]);
+    let endpoint = SecretKey::from_bytes(&[90; 32]).public();
+    let share = active_share(&root, Manifest::empty(share_id, 1), endpoint);
+    let content = b"content";
+    let hash = hex::encode(Sha256::digest(content));
+    let staged = partial_path(&share, "file", &hash);
+    fs::write(&staged, content).unwrap();
+    let mut remote = Manifest::empty(share_id, 2);
+    remote.entries.insert(
+        "file".to_owned(),
+        ManifestEntry {
+            size: content.len() as u64,
+            modified_at_ns: 0,
+            sha256: hash.clone(),
+            permissions: None,
+            version: timestamp(2, endpoint),
+        },
+    );
+    let files = [CompletedFile {
+        file: TransferFile {
+            path: "file".to_owned(),
+            sha256: hash,
+            size: content.len() as u64,
+            offset: 0,
+        },
+        staged_path: staged.clone(),
+    }];
+    let outcome = apply_remote_staged_transfer(&share, &remote, &files).unwrap();
+    assert_eq!(outcome.pending_downloads, 0);
+    assert_eq!(fs::read(root.join("file")).unwrap(), content);
+    assert!(!staged.exists());
+}
+
+#[test]
+fn mismatched_staged_metadata_does_not_install_or_remove_content() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("share");
+    fs::create_dir(&root).unwrap();
+    let share_id = ShareId([91; 32]);
+    let endpoint = SecretKey::from_bytes(&[92; 32]).public();
+    let share = active_share(&root, Manifest::empty(share_id, 1), endpoint);
+    let hash = hex::encode(Sha256::digest(b"content"));
+    let staged = partial_path(&share, "file", &hash);
+    fs::write(&staged, b"content").unwrap();
+    let mut remote = Manifest::empty(share_id, 2);
+    remote.entries.insert(
+        "file".to_owned(),
+        ManifestEntry {
+            size: 7,
+            modified_at_ns: 0,
+            sha256: hash,
+            permissions: None,
+            version: timestamp(2, endpoint),
+        },
+    );
+    let files = [CompletedFile {
+        file: TransferFile {
+            path: "file".to_owned(),
+            sha256: "b".repeat(64),
+            size: 7,
+            offset: 0,
+        },
+        staged_path: staged.clone(),
+    }];
+    assert!(apply_remote_staged_transfer(&share, &remote, &files).is_err());
+    assert_eq!(fs::read(staged).unwrap(), b"content");
+    assert!(!root.join("file").exists());
+}
+
+#[test]
 fn chunk_ranges_resume_from_existing_offset() {
     assert_eq!(chunk_ranges(10, 4, 3), vec![(4, 3), (7, 3), (10, 0)]);
 }

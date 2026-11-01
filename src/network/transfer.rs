@@ -33,9 +33,11 @@ use super::{
     wire::{
         FilePayload, MAX_TRANSFER_FILES, TransferFile, TransferReady, TransferRequest,
         validate_file_payloads, validate_path_list, validate_transfer_file_shapes,
-        validate_transfer_files, validate_transfer_ready,
+        validate_transfer_files, validate_transfer_files_iter, validate_transfer_ready,
     },
 };
+
+const MIN_BINARY_SEARCH_RESUMES: usize = 64;
 
 /// Result of applying a peer's manifest and staged files.
 pub struct ApplyOutcome {
@@ -231,16 +233,24 @@ pub fn build_transfer_files(
 ) -> Result<Vec<TransferFile>> {
     validate_path_list(paths)?;
     validate_transfer_file_shapes(resumes)?;
+    let use_binary_search = paths.len() >= MIN_BINARY_SEARCH_RESUMES
+        && resumes.len() >= MIN_BINARY_SEARCH_RESUMES
+        && resumes.is_sorted_by(|left, right| left.path <= right.path);
     let mut files = Vec::new();
     for path in paths {
         let Some(entry) = manifest.entries.get(path) else {
             continue;
         };
-        let offset = resumes
-            .iter()
-            .find(|resume| {
-                resume.path == *path && resume.sha256 == entry.sha256 && resume.size == entry.size
-            })
+        let resume = if use_binary_search {
+            resumes
+                .binary_search_by(|resume| resume.path.cmp(path))
+                .ok()
+                .map(|index| &resumes[index])
+        } else {
+            resumes.iter().find(|resume| resume.path == *path)
+        };
+        let offset = resume
+            .filter(|resume| resume.sha256 == entry.sha256 && resume.size == entry.size)
             .map_or(0, |resume| resume.offset.min(entry.size));
         files.push(TransferFile {
             path: path.clone(),
@@ -364,10 +374,6 @@ pub async fn send_file_chunks_from_root<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 pub fn ensure_partial_file(path: &Path, offset: u64) -> Result<fs::File> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("unable to create transfer state {}", parent.display()))?;
-    }
     let previous_length = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() => Some(metadata.len()),
         Ok(_) => bail!("transfer partial path is not a regular file"),
@@ -377,12 +383,25 @@ pub fn ensure_partial_file(path: &Path, offset: u64) -> Result<fs::File> {
                 .with_context(|| format!("unable to inspect transfer partial {}", path.display()));
         }
     };
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(previous_length.is_none())
-        .open(path)
-        .with_context(|| format!("unable to open transfer partial {}", path.display()))?;
+    let open = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(previous_length.is_none())
+            .open(path)
+    };
+    let file = match open() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && previous_length.is_none() => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("unable to create transfer state {}", parent.display())
+                })?;
+            }
+            open()
+        }
+        result => result,
+    }
+    .with_context(|| format!("unable to open transfer partial {}", path.display()))?;
     if previous_length.unwrap_or(0) != offset {
         file.set_len(offset)
             .with_context(|| format!("unable to resize transfer partial {}", path.display()))?;
@@ -511,7 +530,7 @@ pub async fn receive_upload_chunks(
         &TransferReady {
             protocol_version: PROTOCOL_VERSION,
             share_id,
-            uploads: ready.to_vec(),
+            uploads: ready,
         },
         share_id,
         requested,
@@ -520,9 +539,9 @@ pub async fn receive_upload_chunks(
 }
 
 #[allow(dead_code)]
-pub enum IncomingFile {
+pub enum IncomingFile<'a> {
     Bytes(Vec<u8>),
-    Staged(PathBuf),
+    Staged(&'a Path),
 }
 
 pub struct CompletedFile {
@@ -543,7 +562,7 @@ pub fn apply_remote_transfer(
         let bytes = URL_SAFE_NO_PAD
             .decode(&file.content)
             .map_err(|_| anyhow!("network file payload is not valid base64url"))?;
-        file_data.insert(file.path.clone(), IncomingFile::Bytes(bytes));
+        file_data.insert(file.path.as_str(), IncomingFile::Bytes(bytes));
     }
     apply_remote_transfer_impl(share, remote, &file_data)
 }
@@ -554,16 +573,12 @@ pub fn apply_remote_staged_transfer(
     files: &[CompletedFile],
 ) -> Result<ApplyOutcome> {
     remote.validate(share.share_id)?;
-    let descriptors = files
-        .iter()
-        .map(|file| file.file.clone())
-        .collect::<Vec<_>>();
-    validate_transfer_files(&descriptors, remote)?;
+    validate_transfer_files_iter(files.iter().map(|file| &file.file), remote)?;
     let mut file_data = BTreeMap::new();
     for file in files {
         file_data.insert(
-            file.file.path.clone(),
-            IncomingFile::Staged(file.staged_path.clone()),
+            file.file.path.as_str(),
+            IncomingFile::Staged(file.staged_path.as_path()),
         );
     }
     let result = apply_remote_transfer_impl(share, remote, &file_data);
@@ -578,7 +593,7 @@ pub fn apply_remote_staged_transfer(
 pub fn apply_remote_transfer_impl(
     share: &Arc<ActiveShare>,
     remote: &Manifest,
-    file_data: &BTreeMap<String, IncomingFile>,
+    file_data: &BTreeMap<&str, IncomingFile<'_>>,
 ) -> Result<ApplyOutcome> {
     let config = share.config()?;
     let root = config_root(&config)?;
@@ -589,97 +604,106 @@ pub fn apply_remote_transfer_impl(
     let mut hash_buffer = Vec::new();
     let mut pending_downloads = 0_usize;
     let mut applied_records = 0_usize;
-    let mut all_paths = remote
-        .paths()
-        .filter(|path| remote_record_wins(local.record(path), remote.record(path)))
+    let mut deletions = remote
+        .tombstones
+        .iter()
+        .filter(|(path, tombstone)| {
+            remote_record_wins(
+                local.record(path),
+                Some(ManifestRecordRef::Tombstone(tombstone)),
+            )
+        })
         .collect::<Vec<_>>();
-    all_paths.sort_by(|left, right| {
+    deletions.sort_by(|(left, _), (right, _)| {
         manifest_path_depth(right)
             .cmp(&manifest_path_depth(left))
             .then_with(|| right.cmp(left))
     });
-    for &path in &all_paths {
-        if let Some(ManifestRecordRef::Tombstone(tombstone)) = remote.record(path) {
-            remove_local_path(&root, path)?;
-            let candidate = candidate.to_mut();
-            candidate.entries.remove(path);
-            candidate.directories.remove(path);
-            candidate.symlinks.remove(path);
-            candidate.tombstones.insert(path.clone(), tombstone.clone());
-            applied_records = applied_records.saturating_add(1);
-        }
+    for (path, tombstone) in deletions {
+        remove_local_path(&root, path)?;
+        let candidate = candidate.to_mut();
+        candidate.entries.remove(path);
+        candidate.directories.remove(path);
+        candidate.symlinks.remove(path);
+        candidate.tombstones.insert(path.clone(), tombstone.clone());
+        applied_records = applied_records.saturating_add(1);
     }
 
-    all_paths.sort_unstable();
     let mut directory_permissions = Vec::new();
-    for &path in &all_paths {
-        if let Some(ManifestRecordRef::Directory(entry)) = remote.record(path) {
-            ensure_local_directory(&root, path)?;
-            let candidate = candidate.to_mut();
-            candidate.entries.remove(path);
-            candidate.symlinks.remove(path);
-            candidate.tombstones.remove(path);
-            candidate.directories.insert(path.clone(), entry.clone());
-            directory_permissions.push((path.clone(), entry.permissions));
-            applied_records = applied_records.saturating_add(1);
+    for (path, entry) in &remote.directories {
+        if !remote_record_wins(
+            local.record(path),
+            Some(ManifestRecordRef::Directory(entry)),
+        ) {
+            continue;
         }
+        ensure_local_directory(&root, path)?;
+        let candidate = candidate.to_mut();
+        candidate.entries.remove(path);
+        candidate.symlinks.remove(path);
+        candidate.tombstones.remove(path);
+        candidate.directories.insert(path.clone(), entry.clone());
+        directory_permissions.push((path, entry.permissions));
+        applied_records = applied_records.saturating_add(1);
     }
 
-    for &path in &all_paths {
-        if let Some(ManifestRecordRef::Symlink(entry)) = remote.record(path) {
-            write_local_symlink(share, &root, path, &entry.target)?;
-            let candidate = candidate.to_mut();
-            candidate.entries.remove(path);
-            candidate.directories.remove(path);
-            candidate.tombstones.remove(path);
-            candidate.symlinks.insert(path.clone(), entry.clone());
-            applied_records = applied_records.saturating_add(1);
+    for (path, entry) in &remote.symlinks {
+        if !remote_record_wins(local.record(path), Some(ManifestRecordRef::Symlink(entry))) {
+            continue;
         }
+        write_local_symlink(share, &root, path, &entry.target)?;
+        let candidate = candidate.to_mut();
+        candidate.entries.remove(path);
+        candidate.directories.remove(path);
+        candidate.tombstones.remove(path);
+        candidate.symlinks.insert(path.clone(), entry.clone());
+        applied_records = applied_records.saturating_add(1);
     }
 
-    for &path in &all_paths {
-        if let Some(ManifestRecordRef::File(entry)) = remote.record(path) {
-            if let Some(incoming) = file_data.get(path) {
-                match incoming {
-                    IncomingFile::Bytes(bytes) => {
-                        write_local_file(share, &root, path, bytes, entry.permissions)?;
-                    }
-                    IncomingFile::Staged(staged_path) => {
-                        write_local_staged_file(&root, path, staged_path, entry.permissions)?;
-                    }
+    for (path, entry) in &remote.entries {
+        if !remote_record_wins(local.record(path), Some(ManifestRecordRef::File(entry))) {
+            continue;
+        }
+        if let Some(incoming) = file_data.get(path.as_str()) {
+            match incoming {
+                IncomingFile::Bytes(bytes) => {
+                    write_local_file(share, &root, path, bytes, entry.permissions)?;
                 }
+                IncomingFile::Staged(staged_path) => {
+                    write_local_staged_file(&root, path, staged_path, entry.permissions)?;
+                }
+            }
+            let candidate = candidate.to_mut();
+            candidate.directories.remove(path);
+            candidate.entries.remove(path);
+            candidate.tombstones.remove(path);
+            candidate.symlinks.remove(path);
+            candidate.entries.insert(path.clone(), entry.clone());
+            applied_records = applied_records.saturating_add(1);
+        } else {
+            // Metadata-only changes, including chmod, do not need to retransmit unchanged
+            // content. Keep the manifest conservative if the local file disappeared after its
+            // most recent scan.
+            let local_content_matches = local.entries.get(path).is_some_and(|local_entry| {
+                local_entry.size == entry.size && local_entry.sha256 == entry.sha256
+            });
+            if local_content_matches
+                && local_file_matches_entry(
+                    &root,
+                    path,
+                    entry.size,
+                    &entry.sha256,
+                    &mut hash_buffer,
+                )?
+            {
+                set_local_file_permissions(&root, path, entry.permissions)?;
                 let candidate = candidate.to_mut();
                 candidate.directories.remove(path);
-                candidate.entries.remove(path);
                 candidate.tombstones.remove(path);
-                candidate.symlinks.remove(path);
                 candidate.entries.insert(path.clone(), entry.clone());
                 applied_records = applied_records.saturating_add(1);
             } else {
-                // Metadata-only changes, including chmod, do not need to retransmit unchanged
-                // content. Keep the manifest conservative if the local file disappeared after its
-                // most recent scan.
-                let local_content_matches = local.entries.get(path).is_some_and(|local_entry| {
-                    local_entry.size == entry.size && local_entry.sha256 == entry.sha256
-                });
-                if local_content_matches
-                    && local_file_matches_entry(
-                        &root,
-                        path,
-                        entry.size,
-                        &entry.sha256,
-                        &mut hash_buffer,
-                    )?
-                {
-                    set_local_file_permissions(&root, path, entry.permissions)?;
-                    let candidate = candidate.to_mut();
-                    candidate.directories.remove(path);
-                    candidate.tombstones.remove(path);
-                    candidate.entries.insert(path.clone(), entry.clone());
-                    applied_records = applied_records.saturating_add(1);
-                } else {
-                    pending_downloads = pending_downloads.saturating_add(1);
-                }
+                pending_downloads = pending_downloads.saturating_add(1);
             }
         }
     }
@@ -692,7 +716,7 @@ pub fn apply_remote_transfer_impl(
             .then_with(|| right.cmp(left))
     });
     for (path, permissions) in directory_permissions {
-        set_local_directory_permissions(&root, &path, permissions)?;
+        set_local_directory_permissions(&root, path, permissions)?;
     }
     let unsupported_items = unsupported_symlink_count(&candidate);
     if let Cow::Owned(mut candidate) = candidate {

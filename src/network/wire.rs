@@ -54,10 +54,10 @@ pub struct TransferRequest {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TransferReady {
+pub struct TransferReady<F = Vec<TransferFile>> {
     pub(crate) protocol_version: u16,
     pub(crate) share_id: ShareId,
-    pub(crate) uploads: Vec<TransferFile>,
+    pub(crate) uploads: F,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -124,10 +124,9 @@ pub fn validate_transfer_request(
         bail!("file transfer request has an incompatible protocol or share ID");
     }
     manifest.validate(share_id)?;
-    validate_path_list(&request.download_paths)?;
+    let requested_downloads = validate_path_list_unique(&request.download_paths)?;
     validate_transfer_files(&request.uploads, manifest)?;
     validate_transfer_file_shapes(&request.download_resumes)?;
-    let requested_downloads = request.download_paths.iter().collect::<HashSet<_>>();
     for resume in &request.download_resumes {
         if !requested_downloads.contains(&resume.path) {
             bail!("network transfer resume path was not requested");
@@ -136,19 +135,20 @@ pub fn validate_transfer_request(
     Ok(())
 }
 
-pub fn validate_transfer_ready(
-    ready: &TransferReady,
+pub fn validate_transfer_ready<F: AsRef<[TransferFile]>>(
+    ready: &TransferReady<F>,
     share_id: ShareId,
     requested: &[TransferFile],
 ) -> Result<()> {
     if ready.protocol_version != PROTOCOL_VERSION || ready.share_id != share_id {
         bail!("file transfer ready message has an incompatible protocol or share ID");
     }
-    validate_transfer_file_shapes(&ready.uploads)?;
-    if ready.uploads.len() != requested.len() {
+    let uploads = ready.uploads.as_ref();
+    validate_transfer_file_shapes(uploads)?;
+    if uploads.len() != requested.len() {
         bail!("file transfer ready message has an unexpected upload count");
     }
-    for (actual, expected) in ready.uploads.iter().zip(requested) {
+    for (actual, expected) in uploads.iter().zip(requested) {
         if actual.path != expected.path
             || actual.sha256 != expected.sha256
             || actual.size != expected.size
@@ -168,6 +168,12 @@ pub fn validate_transfer_response(response: &TransferResponse, share_id: ShareId
 }
 
 pub fn validate_transfer_file_shapes(files: &[TransferFile]) -> Result<()> {
+    validate_transfer_file_shapes_iter(files.iter())
+}
+
+fn validate_transfer_file_shapes_iter<'a>(
+    files: impl ExactSizeIterator<Item = &'a TransferFile>,
+) -> Result<()> {
     if files.len() > MAX_TRANSFER_FILES {
         bail!("network transfer contains too many files");
     }
@@ -186,7 +192,14 @@ pub fn validate_transfer_file_shapes(files: &[TransferFile]) -> Result<()> {
 }
 
 pub fn validate_transfer_files(files: &[TransferFile], manifest: &Manifest) -> Result<()> {
-    validate_transfer_file_shapes(files)?;
+    validate_transfer_files_iter(files.iter(), manifest)
+}
+
+pub fn validate_transfer_files_iter<'a>(
+    files: impl ExactSizeIterator<Item = &'a TransferFile> + Clone,
+    manifest: &Manifest,
+) -> Result<()> {
+    validate_transfer_file_shapes_iter(files.clone())?;
     for file in files {
         let entry = manifest
             .entries
@@ -225,6 +238,10 @@ pub fn validate_wire_peers(peers: &[String]) -> Result<()> {
 }
 
 pub fn validate_path_list(paths: &[String]) -> Result<()> {
+    validate_path_list_unique(paths).map(drop)
+}
+
+fn validate_path_list_unique(paths: &[String]) -> Result<HashSet<&String>> {
     if paths.len() > MAX_TRANSFER_FILES {
         bail!("network file request contains too many paths");
     }
@@ -235,7 +252,7 @@ pub fn validate_path_list(paths: &[String]) -> Result<()> {
             bail!("network file request contains duplicate paths");
         }
     }
-    Ok(())
+    Ok(unique)
 }
 
 #[allow(dead_code)]

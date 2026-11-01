@@ -34,13 +34,26 @@ pub fn merge_manifests(local: &Manifest, remote: &Manifest, now_ms: u64) -> Resu
 }
 
 pub fn validate_manifest_hierarchy(manifest: &Manifest) -> Result<()> {
+    if manifest.entries.is_empty() && manifest.symlinks.is_empty() && manifest.tombstones.is_empty()
+    {
+        return Ok(());
+    }
+    let mut previous_path: &str = "";
     for path in manifest
         .entries
         .keys()
         .chain(manifest.directories.keys())
         .chain(manifest.symlinks.keys())
     {
+        let mut shared_ancestors = true;
         for (separator, _) in path.match_indices('/') {
+            if shared_ancestors {
+                shared_ancestors = previous_path.as_bytes().get(..=separator)
+                    == Some(&path.as_bytes()[..=separator]);
+                if shared_ancestors {
+                    continue;
+                }
+            }
             let ancestor = &path[..separator];
             if manifest.entries.contains_key(ancestor) || manifest.symlinks.contains_key(ancestor) {
                 bail!("manifest live path has a descendant: {ancestor}");
@@ -49,6 +62,7 @@ pub fn validate_manifest_hierarchy(manifest: &Manifest) -> Result<()> {
                 bail!("manifest has a live path below a tombstone: {ancestor}");
             }
         }
+        previous_path = path;
     }
     Ok(())
 }

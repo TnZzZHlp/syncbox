@@ -548,6 +548,50 @@ fn remote_transfer_replaces_an_empty_directory_with_a_file() {
     assert!(stored.tombstones == remote.tombstones);
 }
 
+#[test]
+fn remote_transfer_removes_nested_records_before_their_directories() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("share");
+    fs::create_dir_all(root.join("tree/sub")).unwrap();
+    fs::write(root.join("tree/sub/file"), b"content").unwrap();
+    let share_id = ShareId([93; 32]);
+    let endpoint = SecretKey::from_bytes(&[94; 32]).public();
+    let mut local = Manifest::empty(share_id, 1);
+    local.entries.insert(
+        "tree/sub/file".to_owned(),
+        ManifestEntry {
+            size: 7,
+            modified_at_ns: 0,
+            sha256: hex::encode(Sha256::digest(b"content")),
+            permissions: None,
+            version: timestamp(1, endpoint),
+        },
+    );
+    for path in ["tree", "tree/sub"] {
+        local.directories.insert(
+            path.to_owned(),
+            crate::manifest::DirectoryEntry {
+                permissions: None,
+                version: timestamp(1, endpoint),
+            },
+        );
+    }
+    let share = active_share(&root, local, endpoint);
+    let mut remote = Manifest::empty(share_id, 2);
+    for path in ["tree", "tree/sub", "tree/sub/file"] {
+        remote.tombstones.insert(
+            path.to_owned(),
+            crate::manifest::Tombstone {
+                version: timestamp(2, endpoint),
+            },
+        );
+    }
+    let outcome = apply_remote_transfer(&share, &remote, &[]).unwrap();
+    assert_eq!(outcome.applied_records, 3);
+    assert!(!root.join("tree").exists());
+    assert!(share.paths.load_manifest(share_id).unwrap().tombstones == remote.tombstones);
+}
+
 #[cfg(unix)]
 #[test]
 fn removing_a_missing_nested_path_does_not_create_parent_directories() {
