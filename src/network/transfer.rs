@@ -170,10 +170,13 @@ pub fn partial_path(share: &Arc<ActiveShare>, manifest_path: &str, sha256: &str)
     hasher.update(manifest_path.as_bytes());
     hasher.update([0]);
     hasher.update(sha256.as_bytes());
+    let mut name = *b"chunk-0000000000000000000000000000000000000000000000000000000000000000.part";
+    hex::encode_to_slice(hasher.finalize(), &mut name[6..70])
+        .expect("SHA-256 encodes to 64 hexadecimal bytes");
     share
         .paths
         .share_tmp_dir(share.share_id)
-        .join(format!("chunk-{}.part", hex::encode(hasher.finalize())))
+        .join(std::str::from_utf8(&name).expect("partial file name contains only ASCII characters"))
 }
 
 pub fn partial_size(

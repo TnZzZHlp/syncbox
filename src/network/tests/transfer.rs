@@ -73,6 +73,13 @@ fn staged_transfer_installs_verified_content_and_cleans_the_partial() {
     let content = b"content";
     let hash = hex::encode(Sha256::digest(content));
     let staged = partial_path(&share, "file", &hash);
+    assert_eq!(
+        staged,
+        share
+            .paths
+            .share_tmp_dir(share_id)
+            .join("chunk-64b784fa131cc0b73e1d7cb8c52e5e23ae48e00f955111f8252c5292bc991339.part")
+    );
     fs::write(&staged, content).unwrap();
     let mut remote = Manifest::empty(share_id, 2);
     remote.entries.insert(
