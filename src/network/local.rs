@@ -425,16 +425,9 @@ pub fn with_writable_parents<T>(
         for component in &components[..components.len().saturating_sub(1)] {
             parent.push(component);
             match fs::symlink_metadata(&parent) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    bail!("shared path contains a symbolic link: {}", parent.display())
+                Ok(metadata) => {
+                    prepare_inspected_directory_for_write(&parent, &metadata, true, &mut restores)?;
                 }
-                Ok(metadata) if !metadata.is_dir() => {
-                    bail!(
-                        "shared path parent is not a directory: {}",
-                        parent.display()
-                    )
-                }
-                Ok(_) => prepare_directory_for_write(&parent, true, &mut restores)?,
                 Err(error)
                     if error.kind() == std::io::ErrorKind::NotFound && create_missing_parents =>
                 {
@@ -488,10 +481,20 @@ pub fn prepare_directory_for_write(
     restore_existing_permissions: bool,
     restores: &mut Vec<PermissionRestore>,
 ) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("unable to inspect shared directory {}", path.display()))?;
+    prepare_inspected_directory_for_write(path, &metadata, restore_existing_permissions, restores)
+}
+
+#[cfg(unix)]
+fn prepare_inspected_directory_for_write(
+    path: &Path,
+    metadata: &fs::Metadata,
+    restore_existing_permissions: bool,
+    restores: &mut Vec<PermissionRestore>,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
     if metadata.file_type().is_symlink() {
         bail!("shared path contains a symbolic link: {}", path.display());
     }

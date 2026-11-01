@@ -176,6 +176,30 @@ fn invalid_transfer_partial_is_removed_after_hash_mismatch() {
 
 #[cfg(unix)]
 #[test]
+fn rejected_parent_symlink_restores_prepared_directory_permissions() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("share");
+    let directory = root.join("directory");
+    let outside = temporary.path().join("outside");
+    fs::create_dir_all(&directory).unwrap();
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, directory.join("link")).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o555)).unwrap();
+    let error = with_writable_parents::<()>(&root, "directory/link/file", true, || {
+        panic!("an unsafe parent must prevent the operation")
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("symbolic link"));
+    assert_eq!(
+        fs::metadata(&directory).unwrap().permissions().mode() & 0o7777,
+        0o555
+    );
+    assert!(!outside.join("file").exists());
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn cross_device_copy_temporarily_makes_read_only_target_writable() {
     let temporary = TempDir::new().unwrap();
     let target = temporary.path().join("target.txt");
