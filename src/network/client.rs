@@ -19,7 +19,7 @@ use super::{
     scheduling::PeerSyncOutcome,
     state::{ActiveShare, known_peer_strings, merge_remote_peers, scan_and_save, update_runtime},
     transfer::{
-        apply_remote_staged_transfer, make_transfer_request, receive_download_chunks,
+        apply_validated_remote_staged_transfer, make_transfer_request, receive_download_chunks,
         send_upload_chunks,
     },
     wire::{
@@ -187,7 +187,7 @@ pub async fn sync_with_peer(
         .finish()
         .context("unable to finish upload stream")?;
     let final_response: TransferResponse = read_json_frame(&mut recv).await?;
-    validate_transfer_response(&final_response, share.share_id)?;
+    let validated_remote = validate_transfer_response(&final_response, share.share_id)?;
     info!(
         share_id = %share.share_id,
         peer_endpoint_id = %expected_peer,
@@ -200,7 +200,7 @@ pub async fn sync_with_peer(
             receive_download_chunks(share, expected_peer, &final_response.files, &mut recv).await?;
         let _operation_lock = share.operation_lock.lock().await;
         let applied = run_blocking(|| {
-            apply_remote_staged_transfer(share, &final_response.manifest, &completed)
+            apply_validated_remote_staged_transfer(share, validated_remote, &completed)
         })?;
         if applied.applied_records > 0 {
             update_runtime(share, |status, now_ms| {

@@ -101,18 +101,38 @@ pub fn validate_sync_response(response: &SyncResponse, share_id: ShareId) -> Res
     validate_wire_peers(&response.known_peers)
 }
 
-pub fn validate_manifest_message(
-    message: &ManifestMessage,
+#[derive(Clone, Copy)]
+pub struct ValidatedManifest<'a> {
+    manifest: &'a Manifest,
+}
+
+impl<'a> ValidatedManifest<'a> {
+    pub(super) fn validate(manifest: &'a Manifest, share_id: ShareId) -> Result<Self> {
+        manifest.validate(share_id)?;
+        Ok(Self { manifest })
+    }
+
+    pub(super) fn for_share(self, share_id: ShareId) -> Result<&'a Manifest> {
+        if self.manifest.share_id != share_id {
+            bail!("manifest share ID does not match its directory");
+        }
+        Ok(self.manifest)
+    }
+}
+
+pub fn validate_manifest_message<'a>(
+    message: &'a ManifestMessage,
     share_id: ShareId,
     expected_digest: &[u8; 32],
-) -> Result<()> {
+) -> Result<ValidatedManifest<'a>> {
     if message.protocol_version != PROTOCOL_VERSION || message.share_id != share_id {
         bail!("manifest message has an incompatible protocol or share ID");
     }
-    if message.manifest.sync_digest(share_id)? != *expected_digest {
+    let validated = ValidatedManifest::validate(&message.manifest, share_id)?;
+    if message.manifest.sync_digest_after_validation() != *expected_digest {
         bail!("manifest message does not match its advertised digest");
     }
-    Ok(())
+    Ok(validated)
 }
 
 pub fn validate_transfer_request(
@@ -159,12 +179,16 @@ pub fn validate_transfer_ready<F: AsRef<[TransferFile]>>(
     Ok(())
 }
 
-pub fn validate_transfer_response(response: &TransferResponse, share_id: ShareId) -> Result<()> {
+pub fn validate_transfer_response(
+    response: &TransferResponse,
+    share_id: ShareId,
+) -> Result<ValidatedManifest<'_>> {
     if response.protocol_version != PROTOCOL_VERSION || response.share_id != share_id {
         bail!("file transfer response has an incompatible protocol or share ID");
     }
-    response.manifest.validate(share_id)?;
-    validate_transfer_files(&response.files, &response.manifest)
+    let validated = ValidatedManifest::validate(&response.manifest, share_id)?;
+    validate_transfer_files(&response.files, &response.manifest)?;
+    Ok(validated)
 }
 
 pub fn validate_transfer_file_shapes(files: &[TransferFile]) -> Result<()> {

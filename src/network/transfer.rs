@@ -32,8 +32,9 @@ use super::{
     state::{ActiveShare, unsupported_symlink_count},
     wire::{
         FilePayload, MAX_TRANSFER_FILES, TransferFile, TransferReady, TransferRequest,
-        validate_file_payloads, validate_path_list, validate_transfer_file_shapes,
-        validate_transfer_files, validate_transfer_files_iter, validate_transfer_ready,
+        ValidatedManifest, validate_file_payloads, validate_path_list,
+        validate_transfer_file_shapes, validate_transfer_files, validate_transfer_files_iter,
+        validate_transfer_ready,
     },
 };
 
@@ -576,12 +577,25 @@ pub fn apply_remote_transfer(
     apply_remote_transfer_impl(share, remote, &file_data)
 }
 
+#[allow(dead_code)]
 pub fn apply_remote_staged_transfer(
     share: &Arc<ActiveShare>,
     remote: &Manifest,
     files: &[CompletedFile],
 ) -> Result<ApplyOutcome> {
-    remote.validate(share.share_id)?;
+    apply_validated_remote_staged_transfer(
+        share,
+        ValidatedManifest::validate(remote, share.share_id)?,
+        files,
+    )
+}
+
+pub fn apply_validated_remote_staged_transfer(
+    share: &Arc<ActiveShare>,
+    remote: ValidatedManifest<'_>,
+    files: &[CompletedFile],
+) -> Result<ApplyOutcome> {
+    let remote = remote.for_share(share.share_id)?;
     validate_transfer_files_iter(files.iter().map(|file| &file.file), remote)?;
     let mut file_data = BTreeMap::new();
     for file in files {

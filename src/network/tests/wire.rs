@@ -52,6 +52,34 @@ fn transfer_request_rejects_a_resume_outside_its_validated_paths() {
 }
 
 #[test]
+fn validated_manifest_remains_bound_to_its_share() {
+    let share_id = ShareId([106; 32]);
+    let manifest = Manifest::empty(share_id, 1);
+    let message = ManifestMessage {
+        protocol_version: PROTOCOL_VERSION,
+        share_id,
+        manifest,
+    };
+    let digest = message.manifest.sync_digest(share_id).unwrap();
+    let validated = validate_manifest_message(&message, share_id, &digest).unwrap();
+    assert!(validated.for_share(share_id).is_ok());
+    assert!(validated.for_share(ShareId([107; 32])).is_err());
+}
+
+#[test]
+fn incorrect_advertised_digest_does_not_produce_a_validated_manifest() {
+    let share_id = ShareId([108; 32]);
+    let message = ManifestMessage {
+        protocol_version: PROTOCOL_VERSION,
+        share_id,
+        manifest: Manifest::empty(share_id, 1),
+    };
+    let mut digest = message.manifest.sync_digest(share_id).unwrap();
+    digest[0] ^= 1;
+    assert!(validate_manifest_message(&message, share_id, &digest).is_err());
+}
+
+#[test]
 fn sync_request_carries_only_the_manifest_digest() {
     let share_id = ShareId([42; 32]);
     let manifest = Manifest::empty(share_id, 1);

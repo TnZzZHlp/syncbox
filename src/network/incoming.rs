@@ -29,7 +29,7 @@ use super::{
         update_runtime,
     },
     transfer::{
-        apply_remote_staged_transfer, build_transfer_files, make_transfer_ready,
+        apply_validated_remote_staged_transfer, build_transfer_files, make_transfer_ready,
         receive_upload_chunks, send_file_chunks_from_root,
     },
     transport::CONNECTION_IDLE_TIMEOUT,
@@ -188,7 +188,8 @@ pub async fn handle_sync_stream(
     }
 
     let remote_message: ManifestMessage = read_json_frame(&mut recv).await?;
-    validate_manifest_message(&remote_message, share.share_id, &request.manifest_digest)?;
+    let validated_remote =
+        validate_manifest_message(&remote_message, share.share_id, &request.manifest_digest)?;
     info!(
         share_id = %share.share_id,
         peer_endpoint_id = %peer_endpoint_id,
@@ -238,7 +239,7 @@ pub async fn handle_sync_stream(
         .await?;
         let _operation_lock = share.operation_lock.lock().await;
         let applied = run_blocking(|| {
-            apply_remote_staged_transfer(&share, &remote_message.manifest, &uploaded)
+            apply_validated_remote_staged_transfer(&share, validated_remote, &uploaded)
         })?;
         let final_manifest = share.manifest_snapshot()?;
         let files = build_transfer_files(
