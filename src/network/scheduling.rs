@@ -130,11 +130,29 @@ pub fn select_due_peers(
     now: Instant,
     generation: u64,
 ) {
-    candidates.retain(|peer| {
-        schedules
-            .get(peer)
-            .is_none_or(|schedule| schedule.due(now, generation))
-    });
-    candidates.sort_by_key(|peer| schedules.get(peer).and_then(|schedule| schedule.next_at));
-    candidates.truncate(4);
+    if candidates.len() <= 1 {
+        candidates.retain(|peer| {
+            schedules
+                .get(peer)
+                .is_none_or(|schedule| schedule.due(now, generation))
+        });
+        return;
+    }
+    let mut selected: [Option<(Option<Instant>, EndpointId)>; 4] = [None; 4];
+    for &peer in candidates.iter() {
+        let schedule = schedules.get(&peer);
+        if schedule.is_some_and(|schedule| !schedule.due(now, generation)) {
+            continue;
+        }
+        let next_at = schedule.and_then(|schedule| schedule.next_at);
+        if let Some(position) = selected
+            .iter()
+            .position(|entry| entry.is_none_or(|(at, _)| next_at < at))
+        {
+            selected[position..].rotate_right(1);
+            selected[position] = Some((next_at, peer));
+        }
+    }
+    candidates.clear();
+    candidates.extend(selected.into_iter().flatten().map(|(_, peer)| peer));
 }

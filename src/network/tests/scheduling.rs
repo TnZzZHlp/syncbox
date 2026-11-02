@@ -135,6 +135,38 @@ fn peer_selection_reaches_nodes_beyond_the_first_four() {
 }
 
 #[test]
+fn peer_selection_preserves_priority_and_stable_ties_at_the_limit() {
+    let peers: Vec<_> = (110..118)
+        .map(|seed| SecretKey::from_bytes(&[seed; 32]).public())
+        .collect();
+    let now = Instant::now();
+    let mut schedules = HashMap::new();
+    for (index, &peer) in peers.iter().enumerate() {
+        if index == 6 {
+            continue;
+        }
+        let next_at = match index {
+            3 => None,
+            4 => Some(now + Duration::from_secs(1)),
+            7 => Some(now.checked_sub(Duration::from_secs(3)).unwrap()),
+            1 => Some(now.checked_sub(Duration::from_secs(1)).unwrap()),
+            _ => Some(now.checked_sub(Duration::from_secs(2)).unwrap()),
+        };
+        schedules.insert(
+            peer,
+            PeerSchedule {
+                next_at,
+                last_attempted_generation: 1,
+                ..PeerSchedule::default()
+            },
+        );
+    }
+    let mut selected = peers.clone();
+    select_due_peers(&mut selected, &schedules, now, 1);
+    assert_eq!(selected, [peers[3], peers[6], peers[7], peers[0]]);
+}
+
+#[test]
 fn initial_sync_status_distinguishes_pending_work() {
     assert_eq!(
         initial_sync_status(&SyncOutcome {
