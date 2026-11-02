@@ -6,6 +6,8 @@ use iroh::EndpointId;
 use rand::RngExt as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
+const MIN_BINARY_SEARCH_PEERS: usize = 64;
+
 pub const FORMAT_VERSION: u16 = 1;
 pub const PROTOCOL_VERSION: u16 = 6;
 /// `ShareTickets` only carry credentials and peer addresses. Their version remains stable across
@@ -283,15 +285,31 @@ impl KnownPeers {
     }
 
     pub fn add_or_touch(&mut self, endpoint_id: &EndpointId, now_ms: u64) {
-        if self.add_or_touch_unsorted(endpoint_id, now_ms) {
+        if self.add_or_touch_unsorted(endpoint_id, now_ms, 0) {
             self.peers
                 .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
         }
     }
 
-    fn add_or_touch_unsorted(&mut self, endpoint_id: &EndpointId, now_ms: u64) -> bool {
+    fn add_or_touch_unsorted(
+        &mut self,
+        endpoint_id: &EndpointId,
+        now_ms: u64,
+        sorted_prefix: usize,
+    ) -> bool {
         let value = endpoint_id_string(endpoint_id);
-        if let Some(existing) = self.peers.iter_mut().find(|peer| peer.endpoint_id == value) {
+        let existing = if sorted_prefix == 0 {
+            self.peers.iter_mut().find(|peer| peer.endpoint_id == value)
+        } else {
+            let (sorted, appended) = self.peers.split_at_mut(sorted_prefix);
+            sorted
+                .binary_search_by(|peer| peer.endpoint_id.cmp(&value))
+                .map_or_else(
+                    |_| appended.iter_mut().find(|peer| peer.endpoint_id == value),
+                    |index| Some(&mut sorted[index]),
+                )
+        };
+        if let Some(existing) = existing {
             existing.last_seen_at_ms = Some(now_ms);
             return false;
         }
@@ -307,9 +325,20 @@ impl KnownPeers {
     where
         I: IntoIterator<Item = EndpointId>,
     {
+        let endpoint_ids = endpoint_ids.into_iter();
+        let sorted_prefix = if self.peers.len() >= MIN_BINARY_SEARCH_PEERS
+            && endpoint_ids.size_hint().0 >= MIN_BINARY_SEARCH_PEERS
+            && self
+                .peers
+                .is_sorted_by(|left, right| left.endpoint_id < right.endpoint_id)
+        {
+            self.peers.len()
+        } else {
+            0
+        };
         let mut inserted = false;
         for endpoint_id in endpoint_ids {
-            inserted |= self.add_or_touch_unsorted(&endpoint_id, now_ms);
+            inserted |= self.add_or_touch_unsorted(&endpoint_id, now_ms, sorted_prefix);
         }
         if inserted {
             self.peers
