@@ -200,6 +200,22 @@ fn rejected_parent_symlink_restores_prepared_directory_permissions() {
 
 #[cfg(unix)]
 #[test]
+fn readable_file_permissions_are_restored_after_an_operation_error() {
+    let temporary = TempDir::new().unwrap();
+    let target = temporary.path().join("file");
+    fs::write(&target, b"content").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
+    let metadata = fs::symlink_metadata(&target).unwrap();
+    let result = with_readable_file::<()>(&target, &metadata, || Err(anyhow!("operation failed")));
+    assert_eq!(result.unwrap_err().to_string(), "operation failed");
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn cross_device_copy_temporarily_makes_read_only_target_writable() {
     let temporary = TempDir::new().unwrap();
     let target = temporary.path().join("target.txt");

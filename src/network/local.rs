@@ -116,7 +116,7 @@ pub fn local_file_matches_entry(
             }
         };
         let before_modified = metadata.modified().ok();
-        with_readable_file(&target, || {
+        with_readable_file(&target, &metadata, || {
             let mut file = fs::File::open(&target)
                 .with_context(|| format!("unable to read shared file {}", target.display()))?;
             let mut hasher = Sha256::new();
@@ -545,11 +545,13 @@ pub fn with_writable_parents<T>(
 }
 
 #[cfg(unix)]
-pub fn with_readable_file<T>(target: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+pub fn with_readable_file<T>(
+    target: &Path,
+    metadata: &fs::Metadata,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let metadata = fs::symlink_metadata(target)
-        .with_context(|| format!("unable to inspect shared file {}", target.display()))?;
     if metadata.file_type().is_symlink() {
         bail!("refusing to read symbolic link {}", target.display());
     }
@@ -591,7 +593,11 @@ pub fn with_readable_file<T>(target: &Path, operation: impl FnOnce() -> Result<T
 }
 
 #[cfg(not(unix))]
-pub fn with_readable_file<T>(_target: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+pub fn with_readable_file<T>(
+    _target: &Path,
+    _metadata: &fs::Metadata,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     operation()
 }
 
