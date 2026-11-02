@@ -24,9 +24,9 @@ use super::{
     HASH_BUFFER_BYTES,
     io::{RecvStream, SendStream},
     local::{
-        config_root, ensure_local_directory, local_file_matches_entry, manifest_path_depth,
-        remove_local_path, safe_local_path, set_local_directory_permissions,
-        set_local_file_permissions, write_local_file, write_local_staged_file, write_local_symlink,
+        ensure_local_directory, local_file_matches_entry, manifest_path_depth, remove_local_path,
+        safe_local_path, set_local_directory_permissions, set_local_file_permissions,
+        write_local_file, write_local_staged_file, write_local_symlink,
     },
     run_blocking,
     state::{ActiveShare, unsupported_symlink_count},
@@ -121,7 +121,7 @@ pub fn build_file_payloads(
     paths: &[String],
 ) -> Result<Vec<FilePayload>> {
     validate_path_list(paths)?;
-    let root = config_root(&share.config()?)?;
+    let root = share.local_root()?;
     let mut files = Vec::new();
     for path in paths {
         let Some(entry) = manifest.entries.get(path) else {
@@ -303,7 +303,7 @@ pub async fn send_file_chunks_from_root<W: tokio::io::AsyncWrite + Unpin>(
     files: &[TransferFile],
     send: &mut W,
 ) -> Result<()> {
-    let root = config_root(&share.config()?)?;
+    let root = share.local_root()?;
     let mut buffer = Vec::new();
     for (file_index, file) in files.iter().enumerate() {
         let file_index = u32::try_from(file_index).context("transfer file index overflow")?;
@@ -618,8 +618,7 @@ pub fn apply_remote_transfer_impl(
     remote: &Manifest,
     file_data: &BTreeMap<&str, IncomingFile<'_>>,
 ) -> Result<ApplyOutcome> {
-    let config = share.config()?;
-    let root = config_root(&config)?;
+    let root = share.local_root()?;
     let local_snapshot = share.manifest_snapshot()?;
     let local = &local_snapshot.manifest;
 

@@ -16,7 +16,6 @@ use tracing::{error, warn};
 use super::{
     HANDSHAKE_TIMEOUT, MAX_INCOMING_HANDLERS, diagnostics,
     incoming::handle_incoming,
-    local::config_root,
     peer_sessions::sync_known_peers,
     registry::ShareRegistry,
     run_blocking,
@@ -46,7 +45,7 @@ pub fn start_watchers(
 ) -> Vec<notify::RecommendedWatcher> {
     let mut watchers = Vec::new();
     for share in registry.values() {
-        let Ok(root) = share.config().and_then(|config| config_root(&config)) else {
+        let Ok(root) = share.local_root() else {
             continue;
         };
         let dirty = Arc::clone(&share.scan_dirty);

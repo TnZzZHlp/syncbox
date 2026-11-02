@@ -18,7 +18,11 @@ use crate::{
 
 use super::{HASH_BUFFER_BYTES, state::ActiveShare};
 pub fn config_root(config: &ShareConfig) -> Result<PathBuf> {
-    let root = PathBuf::from(&config.local_directory);
+    directory_root(&config.local_directory)
+}
+
+pub fn directory_root(directory: &str) -> Result<PathBuf> {
+    let root = PathBuf::from(directory);
     let metadata = fs::metadata(&root)
         .with_context(|| format!("unable to inspect local directory {}", root.display()))?;
     if !metadata.is_dir() {

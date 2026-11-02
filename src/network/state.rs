@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -20,7 +21,7 @@ use crate::{
 };
 
 use super::{
-    local::config_root,
+    local::{config_root, directory_root},
     scheduling::{PeerSchedule, SyncOutcome},
     transport::ConnectionPool,
 };
@@ -118,6 +119,16 @@ impl ActiveShare {
         self.manifest_generation.fetch_add(1, Ordering::Relaxed);
         drop(cache);
         Ok(())
+    }
+
+    pub(crate) fn local_root(&self) -> Result<PathBuf> {
+        let directory = self
+            .config
+            .read()
+            .map_err(|_| anyhow!("share configuration lock was poisoned"))?
+            .local_directory
+            .clone();
+        directory_root(&directory)
     }
 
     pub(crate) fn config(&self) -> Result<ShareConfig> {
