@@ -36,7 +36,7 @@ use super::{
     wire::{
         ManifestMessage, SyncRequest, SyncResponse, TransferRequest, TransferResponse,
         read_json_frame, validate_manifest_message, validate_sync_request,
-        validate_transfer_request, write_json_frame,
+        validate_transfer_request_with_validated_manifest, write_json_frame,
     },
 };
 const STREAM_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -216,7 +216,7 @@ pub async fn handle_sync_stream(
     );
 
     let transfer: TransferRequest = read_json_frame(&mut recv).await?;
-    validate_transfer_request(&transfer, share.share_id, &remote_message.manifest)?;
+    validate_transfer_request_with_validated_manifest(&transfer, share.share_id, validated_remote)?;
     info!(
         share_id = %share.share_id,
         peer_endpoint_id = %peer_endpoint_id,

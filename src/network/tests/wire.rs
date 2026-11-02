@@ -80,6 +80,31 @@ fn incorrect_advertised_digest_does_not_produce_a_validated_manifest() {
 }
 
 #[test]
+fn validated_manifest_does_not_trust_new_upload_descriptors() {
+    let share_id = ShareId([109; 32]);
+    let manifest = Manifest::empty(share_id, 1);
+    let validated = ValidatedManifest::validate(&manifest, share_id).unwrap();
+    let request = TransferRequest {
+        protocol_version: PROTOCOL_VERSION,
+        share_id,
+        download_paths: Vec::new(),
+        download_resumes: Vec::new(),
+        uploads: vec![TransferFile {
+            path: "unexpected".to_owned(),
+            sha256: "a".repeat(64),
+            size: 8,
+            offset: 0,
+        }],
+    };
+    let error = validate_transfer_request_with_validated_manifest(&request, share_id, validated)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "network transfer file is not present in its manifest"
+    );
+}
+
+#[test]
 fn sync_request_carries_only_the_manifest_digest() {
     let share_id = ShareId([42; 32]);
     let manifest = Manifest::empty(share_id, 1);

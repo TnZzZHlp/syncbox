@@ -135,6 +135,7 @@ pub fn validate_manifest_message<'a>(
     Ok(validated)
 }
 
+#[allow(dead_code)]
 pub fn validate_transfer_request(
     request: &TransferRequest,
     share_id: ShareId,
@@ -143,7 +144,19 @@ pub fn validate_transfer_request(
     if request.protocol_version != PROTOCOL_VERSION || request.share_id != share_id {
         bail!("file transfer request has an incompatible protocol or share ID");
     }
-    manifest.validate(share_id)?;
+    let validated = ValidatedManifest::validate(manifest, share_id)?;
+    validate_transfer_request_with_validated_manifest(request, share_id, validated)
+}
+
+pub fn validate_transfer_request_with_validated_manifest(
+    request: &TransferRequest,
+    share_id: ShareId,
+    manifest: ValidatedManifest<'_>,
+) -> Result<()> {
+    if request.protocol_version != PROTOCOL_VERSION || request.share_id != share_id {
+        bail!("file transfer request has an incompatible protocol or share ID");
+    }
+    let manifest = manifest.for_share(share_id)?;
     let requested_downloads = validate_path_list_unique(&request.download_paths)?;
     validate_transfer_files(&request.uploads, manifest)?;
     validate_transfer_file_shapes(&request.download_resumes)?;
