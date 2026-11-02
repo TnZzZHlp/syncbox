@@ -200,6 +200,18 @@ fn rejected_parent_symlink_restores_prepared_directory_permissions() {
 
 #[cfg(unix)]
 #[test]
+fn matching_permission_bits_do_not_allow_a_symbolic_link() {
+    let temporary = TempDir::new().unwrap();
+    let target = temporary.path().join("target");
+    let link = temporary.path().join("link");
+    fs::write(&target, b"content").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let mode = fs::symlink_metadata(&link).unwrap().permissions().mode() & 0o7777;
+    assert!(set_permissions(&link, u16::try_from(mode).unwrap(), false).is_err());
+}
+
+#[cfg(unix)]
+#[test]
 fn readable_file_permissions_are_restored_after_an_operation_error() {
     let temporary = TempDir::new().unwrap();
     let target = temporary.path().join("file");

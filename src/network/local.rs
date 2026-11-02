@@ -616,6 +616,9 @@ pub fn set_permissions(target: &Path, permissions: u16, directory: bool) -> Resu
     if directory != metadata.is_dir() || (!directory && !metadata.is_file()) {
         bail!("shared path has an unexpected type: {}", target.display());
     }
+    if metadata.permissions().mode() & 0o7777 == u32::from(permissions) {
+        return Ok(());
+    }
     fs::set_permissions(target, fs::Permissions::from_mode(u32::from(permissions)))
         .with_context(|| format!("unable to set permissions on {}", target.display()))
 }
