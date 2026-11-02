@@ -2,6 +2,18 @@ use super::*;
 use crate::network::connection_cache::{ConnectionCache, MAX_CACHED_CONNECTIONS};
 
 #[tokio::test]
+async fn maintenance_removes_released_empty_slots() {
+    let cache = ConnectionCache::default();
+    let peer = SecretKey::from_bytes(&[122; 32]).public();
+    let lease = cache.slot(peer).await.unwrap().lease().await;
+    cache.maintain().await;
+    assert!(cache.get(peer).await.is_some());
+    drop(lease);
+    cache.maintain().await;
+    assert!(cache.get(peer).await.is_none());
+}
+
+#[tokio::test]
 async fn full_pool_preserves_active_peers_until_a_lease_is_released() {
     let cache = ConnectionCache::default();
     let mut leases = Vec::new();

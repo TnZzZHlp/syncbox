@@ -84,24 +84,19 @@ pub(super) struct ConnectionCache {
 
 impl ConnectionCache {
     fn reap(peers: &mut HashMap<EndpointId, Arc<PeerSlot>>, now: Instant) {
-        let expired: Vec<_> = peers
-            .iter()
-            .filter_map(|(peer, slot)| {
-                if Arc::strong_count(slot) != 1 {
-                    return None;
-                }
-                let connection = slot.connection.try_lock().ok()?;
-                (connection
-                    .as_ref()
-                    .is_none_or(|connection| connection.close_reason().is_some())
-                    || now.saturating_duration_since(slot.last_used()) >= CONNECTION_IDLE_TIMEOUT)
-                    .then_some(*peer)
-            })
-            .collect();
-        for peer in expired {
-            if let Some(slot) = peers.remove(&peer) {
-                slot.close();
+        for (_, slot) in peers.extract_if(|_, slot| {
+            if Arc::strong_count(slot) != 1 {
+                return false;
             }
+            let Ok(connection) = slot.connection.try_lock() else {
+                return false;
+            };
+            connection
+                .as_ref()
+                .is_none_or(|connection| connection.close_reason().is_some())
+                || now.saturating_duration_since(slot.last_used()) >= CONNECTION_IDLE_TIMEOUT
+        }) {
+            slot.close();
         }
     }
 
