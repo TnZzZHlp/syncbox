@@ -47,7 +47,7 @@ impl ShareId {
         &self.0
     }
 
-    fn hex_bytes(self) -> [u8; Self::HEX_LENGTH] {
+    pub(crate) fn hex_bytes(self) -> [u8; Self::HEX_LENGTH] {
         let mut bytes = [0_u8; Self::HEX_LENGTH];
         hex::encode_to_slice(self.0, &mut bytes).expect("share ID encodes to 64 hexadecimal bytes");
         bytes

@@ -88,32 +88,49 @@ impl DataPaths {
         self.root.join("locks")
     }
 
+    fn share_path(&self, share_id: ShareId, name: Option<&str>) -> PathBuf {
+        let capacity = self.root.as_os_str().len()
+            + "shares".len()
+            + 2
+            + ShareId::HEX_LENGTH
+            + name.map_or(0, |name| name.len() + 1);
+        let mut path = PathBuf::with_capacity(capacity);
+        path.push(&self.root);
+        path.push("shares");
+        let encoded = share_id.hex_bytes();
+        path.push(std::str::from_utf8(&encoded).expect("hexadecimal encoding is ASCII"));
+        if let Some(name) = name {
+            path.push(name);
+        }
+        path
+    }
+
     pub fn share_dir(&self, share_id: ShareId) -> PathBuf {
-        self.shares_dir().join(share_id.to_string())
+        self.share_path(share_id, None)
     }
 
     pub fn share_config(&self, share_id: ShareId) -> PathBuf {
-        self.share_dir(share_id).join("config.json")
+        self.share_path(share_id, Some("config.json"))
     }
 
     pub fn share_manifest(&self, share_id: ShareId) -> PathBuf {
-        self.share_dir(share_id).join("manifest.json")
+        self.share_path(share_id, Some("manifest.json"))
     }
 
     pub fn share_clock(&self, share_id: ShareId) -> PathBuf {
-        self.share_dir(share_id).join("clock.json")
+        self.share_path(share_id, Some("clock.json"))
     }
 
     pub fn share_known_peers(&self, share_id: ShareId) -> PathBuf {
-        self.share_dir(share_id).join("known_peers.json")
+        self.share_path(share_id, Some("known_peers.json"))
     }
 
     pub fn share_runtime_status(&self, share_id: ShareId) -> PathBuf {
-        self.share_dir(share_id).join("runtime-status.json")
+        self.share_path(share_id, Some("runtime-status.json"))
     }
 
     pub fn share_tmp_dir(&self, share_id: ShareId) -> PathBuf {
-        self.share_dir(share_id).join("tmp")
+        self.share_path(share_id, Some("tmp"))
     }
 
     pub fn share_lock(&self, share_id: ShareId) -> PathBuf {
