@@ -214,7 +214,7 @@ fn validate_transfer_file_shapes_iter<'a>(
     if files.len() > MAX_TRANSFER_FILES {
         bail!("network transfer contains too many files");
     }
-    let mut unique = HashSet::new();
+    let mut unique = HashSet::with_capacity(files.len());
     for file in files {
         validate_manifest_path(&file.path)?;
         validate_sha256(&file.sha256)?;
@@ -282,7 +282,7 @@ fn validate_path_list_unique(paths: &[String]) -> Result<HashSet<&String>> {
     if paths.len() > MAX_TRANSFER_FILES {
         bail!("network file request contains too many paths");
     }
-    let mut unique = HashSet::new();
+    let mut unique = HashSet::with_capacity(paths.len());
     for path in paths {
         validate_manifest_path(path)?;
         if !unique.insert(path) {
